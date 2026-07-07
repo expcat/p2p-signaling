@@ -1,0 +1,53 @@
+name: Deploy P2P Signaling to Cloudflare Workers
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: worker
+    
+    steps:
+      # Step 1: 检出代码
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      # Step 2: 安装 Node.js
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'  # 缓存 npm 依赖
+          cache-dependency-path: worker/package-lock.json
+      
+      # Step 3: 安装依赖
+      - name: Install dependencies
+        run: npm ci  # 使用 npm ci 而不是 npm install，更适合 CI 环境
+      
+      # Step 4: 类型检查
+      - name: Type check
+        run: npm run typecheck
+      
+      # Step 5: 部署到 Cloudflare Workers
+      - name: Deploy to Cloudflare Workers
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: worker
+          packageManager: npm
+          command: deploy
+      
+      # Step 6: 发送部署成功通知（可选）
+      - name: Notify deployment
+        if: success()
+        run: |
+          echo "Deployment to Cloudflare Workers successful."
+          echo "Worker: p2p-signaling"
