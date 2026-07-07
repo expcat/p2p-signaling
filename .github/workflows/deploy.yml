@@ -17,13 +17,13 @@ jobs:
     steps:
       # Step 1: 检出代码
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       
       # Step 2: 安装 Node.js
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
-          node-version: '22'
+          node-version: '24'
           cache: 'npm'  # 缓存 npm 依赖
           cache-dependency-path: worker/package-lock.json
       
@@ -37,13 +37,10 @@ jobs:
       
       # Step 5: 部署到 Cloudflare Workers
       - name: Deploy to Cloudflare Workers
-        uses: cloudflare/wrangler-action@v3
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          workingDirectory: worker
-          packageManager: npm
-          command: deploy
+        run: npm run deploy
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       
       # Step 6: 发送部署成功通知（可选）
       - name: Notify deployment
