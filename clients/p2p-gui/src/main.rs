@@ -1,54 +1,65 @@
-use tokio::sync::mpsc;
+use std::path::PathBuf;
+use std::sync::{mpsc as std_mpsc, Arc};
 
-use p2p_core::{ChatSession, SessionEvent, SessionRole};
+use eframe::egui::{
+    self, Align, Color32, Context, CornerRadius, FontData, FontDefinitions, FontFamily, FontId,
+    Frame, Layout, RichText, ScrollArea, Stroke, TextEdit, Ui, Vec2,
+};
+use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::runtime::Runtime;
+use tokio::sync::mpsc as tokio_mpsc;
+
+use p2p_core::{ChatSession, ChatSessionHandle, SessionEvent, SessionRole};
 
 const DEFAULT_SERVER: &str = "p2p-signaling.yizhe.studio";
-const DEFAULT_ROOM: &str = "LOCALHOST";
+const DEFAULT_ROOM: &str = "";
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let (tx, mut rx) = mpsc::channel::<SessionEvent>(32);
+fn main() -> eframe::Result<()> {
+    let initial_config =
+        ClientConfig::from_args(std::env::args().skip(1)).unwrap_or_else(|error| {
+            eprintln!("{error:#}");
+            print_usage();
+            std::process::exit(2);
+        });
 
-    let config = ClientConfig::from_args(std::env::args().skip(1))?;
-    println!("Connecting to {}", config.signaling_url);
-    let session = ChatSession::new(config.role, config.signaling_url);
-    let handle = session.start(tx).await?;
+    let native_options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([920.0, 640.0])
+            .with_min_inner_size([760.0, 520.0]),
+        ..Default::default()
+    };
 
-    let send_handle = handle.clone();
-    tokio::spawn(async move {
-        let _ = send_handle
-            .send_text("hello from the GUI shell".to_string())
-            .await;
-    });
-
-    while let Some(event) = rx.recv().await {
-        println!("EVENT: {event:?}");
-
-        if matches!(event, SessionEvent::Error(_)) {
-            break;
-        }
-    }
-
-    Ok(())
+    eframe::run_native(
+        "P2P Signaling Chat",
+        native_options,
+        Box::new(move |cc| Ok(Box::new(P2pChatApp::new(cc, initial_config)))),
+    )
 }
 
 #[derive(Debug, Clone)]
 struct ClientConfig {
-    role: SessionRole,
-    signaling_url: String,
+    server: String,
+    room: String,
+    role: RoleChoice,
+    server_explicit: bool,
 }
 
 impl ClientConfig {
     fn from_args(args: impl IntoIterator<Item = String>) -> anyhow::Result<Self> {
-        let mut server = DEFAULT_SERVER.to_string();
-        let mut room = DEFAULT_ROOM.to_string();
-        let mut role = "host".to_string();
+        let mut server =
+            std::env::var("P2P_SIGNALING_SERVER").unwrap_or_else(|_| DEFAULT_SERVER.to_string());
+        let mut room = std::env::var("P2P_SIGNALING_ROOM").unwrap_or_else(|_| DEFAULT_ROOM.into());
+        let mut role = std::env::var("P2P_SIGNALING_ROLE").unwrap_or_else(|_| "host".into());
+        let mut server_explicit = std::env::var("P2P_SIGNALING_SERVER").is_ok();
 
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--server" | "-s" => {
                     server = require_value(arg.as_str(), args.next())?;
+                    server_explicit = true;
                 }
                 "--room" | "-r" => {
                     room = require_value(arg.as_str(), args.next())?;
@@ -62,25 +73,612 @@ impl ClientConfig {
                 }
                 value if !value.starts_with('-') => {
                     server = value.to_string();
+                    server_explicit = true;
                 }
                 _ => anyhow::bail!("unknown argument: {arg}"),
             }
         }
 
-        let signaling_url = build_signaling_url(&server, &room)?;
-        let role = match role.as_str() {
-            "host" => SessionRole::Host {
-                room_code: room.clone(),
-            },
-            "guest" => SessionRole::Guest { room_code: room },
-            _ => anyhow::bail!("--role must be either host or guest"),
-        };
-
         Ok(Self {
-            role,
-            signaling_url,
+            server,
+            room: normalize_room_input(&room),
+            role: RoleChoice::parse(&role)?,
+            server_explicit,
         })
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoleChoice {
+    Host,
+    Guest,
+}
+
+impl RoleChoice {
+    fn parse(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "host" => Ok(Self::Host),
+            "guest" => Ok(Self::Guest),
+            _ => anyhow::bail!("--role must be either host or guest"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectionState {
+    Idle,
+    Connecting,
+    Connected,
+    Paired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChatAuthor {
+    Mine,
+    Peer,
+    System,
+}
+
+#[derive(Debug, Clone)]
+struct ChatLine {
+    author: ChatAuthor,
+    text: String,
+}
+
+#[derive(Debug)]
+enum UiNotice {
+    Error(String),
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct StoredConfig {
+    server: String,
+}
+
+struct P2pChatApp {
+    runtime: Arc<Runtime>,
+    server: String,
+    room_input: String,
+    active_room: Option<String>,
+    message_input: String,
+    messages: Vec<ChatLine>,
+    status: String,
+    state: ConnectionState,
+    handle: Option<ChatSessionHandle>,
+    event_rx: Option<tokio_mpsc::Receiver<SessionEvent>>,
+    notice_tx: std_mpsc::Sender<UiNotice>,
+    notice_rx: std_mpsc::Receiver<UiNotice>,
+    config_path: Option<PathBuf>,
+}
+
+impl P2pChatApp {
+    fn new(cc: &eframe::CreationContext<'_>, initial_config: ClientConfig) -> Self {
+        configure_style(&cc.egui_ctx);
+
+        let runtime = Runtime::new().expect("failed to create tokio runtime");
+        let (notice_tx, notice_rx) = std_mpsc::channel();
+        let config_path = config_path();
+        let stored = config_path.as_ref().and_then(load_config);
+        let server = if initial_config.server_explicit {
+            initial_config.server
+        } else {
+            stored
+                .filter(|config| !config.server.trim().is_empty())
+                .map(|config| config.server)
+                .unwrap_or(initial_config.server)
+        };
+
+        let mut app = Self {
+            runtime: Arc::new(runtime),
+            server,
+            room_input: initial_config.room,
+            active_room: None,
+            message_input: String::new(),
+            messages: Vec::new(),
+            status: "未连接".into(),
+            state: ConnectionState::Idle,
+            handle: None,
+            event_rx: None,
+            notice_tx,
+            notice_rx,
+            config_path,
+        };
+
+        if initial_config.role == RoleChoice::Guest && is_valid_room(&app.room_input) {
+            app.status = "已填入房间号，可直接加入".into();
+        }
+
+        app
+    }
+
+    fn create_room(&mut self) {
+        let room = random_room_code();
+        self.room_input = room.clone();
+        self.start_session(SessionRole::Host {
+            room_code: room.clone(),
+        });
+    }
+
+    fn join_room(&mut self) {
+        normalize_room_input_in_place(&mut self.room_input);
+        let room = self.room_input.clone();
+
+        if !is_valid_room(&room) {
+            self.push_system("请输入 4 位数字房间号。");
+            self.status = "房间号需要 4 位数字".into();
+            return;
+        }
+
+        self.start_session(SessionRole::Guest { room_code: room });
+    }
+
+    fn start_session(&mut self, role: SessionRole) {
+        let action = if matches!(role, SessionRole::Host { .. }) {
+            "已创建"
+        } else {
+            "正在加入"
+        };
+        let room = match &role {
+            SessionRole::Host { room_code } | SessionRole::Guest { room_code } => room_code.clone(),
+        };
+
+        let signaling_url = match build_signaling_url(&self.server, &room) {
+            Ok(url) => url,
+            Err(error) => {
+                self.status = format!("{error:#}");
+                self.push_system(self.status.clone());
+                return;
+            }
+        };
+
+        self.close_current_session();
+        self.save_server();
+
+        let (event_tx, event_rx) = tokio_mpsc::channel::<SessionEvent>(64);
+        let session = ChatSession::new(role, signaling_url);
+        match self.runtime.block_on(session.start(event_tx)) {
+            Ok(handle) => {
+                self.handle = Some(handle);
+                self.event_rx = Some(event_rx);
+                self.active_room = Some(room.clone());
+                self.messages.clear();
+                self.state = ConnectionState::Connecting;
+                self.status = format!("正在连接房间 {room}");
+                self.push_system(format!("房间 {room} {action}，正在连接信令服务。"));
+            }
+            Err(error) => {
+                self.status = format!("{error:#}");
+                self.push_system(format!("连接失败：{error:#}"));
+            }
+        }
+    }
+
+    fn send_message(&mut self) {
+        let text = self.message_input.trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+
+        let Some(handle) = self.handle.clone() else {
+            self.push_system("请先创建或加入房间。");
+            return;
+        };
+
+        self.message_input.clear();
+        self.push_message(ChatAuthor::Mine, text.clone());
+
+        let notice_tx = self.notice_tx.clone();
+        self.runtime.spawn(async move {
+            if let Err(error) = handle.send_text(text).await {
+                let _ = notice_tx.send(UiNotice::Error(format!("发送失败：{error:#}")));
+            }
+        });
+    }
+
+    fn close_current_session(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            self.runtime.spawn(async move {
+                let _ = handle.close().await;
+            });
+        }
+
+        self.event_rx = None;
+        self.active_room = None;
+        self.state = ConnectionState::Idle;
+    }
+
+    fn disconnect(&mut self) {
+        self.close_current_session();
+        self.status = "已断开".into();
+        self.push_system("连接已断开。");
+    }
+
+    fn poll_background_events(&mut self, ctx: &Context) {
+        while let Ok(notice) = self.notice_rx.try_recv() {
+            match notice {
+                UiNotice::Error(message) => {
+                    self.status = message.clone();
+                    self.push_system(message);
+                }
+            }
+            ctx.request_repaint();
+        }
+
+        let mut events = Vec::new();
+        if let Some(event_rx) = self.event_rx.as_mut() {
+            while let Ok(event) = event_rx.try_recv() {
+                events.push(event);
+            }
+        }
+
+        for event in events {
+            match event {
+                SessionEvent::Connected => {
+                    if self.state == ConnectionState::Connecting {
+                        self.state = ConnectionState::Connected;
+                    }
+                    self.status = "已连接信令服务，等待对方加入".into();
+                    self.push_system("已连接信令服务。");
+                }
+                SessionEvent::RoomCodeGenerated(room) => {
+                    self.active_room = Some(room);
+                }
+                SessionEvent::PeerConnected => {
+                    self.state = ConnectionState::Paired;
+                    self.status = "已对接，开始聊天".into();
+                    self.push_system("另一客户端已加入房间。");
+                }
+                SessionEvent::PeerDisconnected => {
+                    if self.state == ConnectionState::Paired {
+                        self.state = ConnectionState::Connected;
+                    }
+                    self.status = "对方已离开，等待重新加入".into();
+                    self.push_system("对方已离开房间。");
+                }
+                SessionEvent::MessageReceived(text) => {
+                    self.push_message(ChatAuthor::Peer, text);
+                    ctx.request_repaint();
+                }
+                SessionEvent::Error(message) => {
+                    self.state = ConnectionState::Idle;
+                    self.handle = None;
+                    self.event_rx = None;
+                    self.status = format!("错误：{message}");
+                    self.push_system(format!("错误：{message}"));
+                }
+            }
+        }
+    }
+
+    fn save_server(&mut self) {
+        let server = self.server.trim().to_string();
+        if server.is_empty() {
+            self.status = "信令服务器地址不能为空".into();
+            return;
+        }
+
+        self.server = server.clone();
+        let config = StoredConfig { server };
+        match save_config(self.config_path.as_ref(), &config) {
+            Ok(()) => {
+                if self.state == ConnectionState::Idle {
+                    self.status = "服务器地址已保存".into();
+                }
+            }
+            Err(error) => {
+                self.status = format!("保存失败：{error:#}");
+            }
+        }
+    }
+
+    fn push_message(&mut self, author: ChatAuthor, text: String) {
+        self.messages.push(ChatLine { author, text });
+    }
+
+    fn push_system(&mut self, text: impl Into<String>) {
+        self.push_message(ChatAuthor::System, text.into());
+    }
+
+    fn room_label(&self) -> &str {
+        self.active_room
+            .as_deref()
+            .filter(|room| !room.is_empty())
+            .unwrap_or("----")
+    }
+}
+
+impl eframe::App for P2pChatApp {
+    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        self.poll_background_events(&ctx);
+
+        egui::Panel::top("top_bar").show(ui, |ui| {
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.heading("P2P 信令聊天");
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    status_chip(ui, self.state, &self.status);
+                });
+            });
+            ui.add_space(8.0);
+        });
+
+        egui::Panel::left("connection_panel")
+            .resizable(false)
+            .min_size(284.0)
+            .max_size(284.0)
+            .show(ui, |ui| {
+                ui.add_space(8.0);
+                ui.label(RichText::new("信令服务器").strong());
+                ui.add_space(6.0);
+                ui.add(
+                    TextEdit::singleline(&mut self.server)
+                        .hint_text("p2p-signaling.yizhe.studio")
+                        .desired_width(f32::INFINITY),
+                );
+                ui.add_space(8.0);
+                if ui.button("保存地址").clicked() {
+                    self.save_server();
+                }
+
+                ui.separator();
+                ui.label(RichText::new("房间").strong());
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(self.room_label()).font(FontId::monospace(32.0)));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if self.handle.is_some() && ui.button("断开").clicked() {
+                            self.disconnect();
+                        }
+                    });
+                });
+                ui.add_space(8.0);
+
+                let can_connect = !self.server.trim().is_empty();
+                if ui
+                    .add_enabled(
+                        can_connect,
+                        egui::Button::new("创建 4 位随机房间")
+                            .min_size(Vec2::new(f32::INFINITY, 36.0)),
+                    )
+                    .clicked()
+                {
+                    self.create_room();
+                }
+
+                ui.add_space(14.0);
+                ui.label("输入房间号");
+                let room_response = ui.add(
+                    TextEdit::singleline(&mut self.room_input)
+                        .hint_text("0000")
+                        .char_limit(4)
+                        .desired_width(f32::INFINITY),
+                );
+                if room_response.changed() {
+                    normalize_room_input_in_place(&mut self.room_input);
+                }
+
+                let join_pressed = room_response.lost_focus()
+                    && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                if ui
+                    .add_enabled(
+                        can_connect && is_valid_room(&self.room_input),
+                        egui::Button::new("加入房间").min_size(Vec2::new(f32::INFINITY, 36.0)),
+                    )
+                    .clicked()
+                    || join_pressed
+                {
+                    self.join_room();
+                }
+
+                ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
+                    ui.label(RichText::new(&self.status).color(Color32::from_rgb(158, 169, 185)));
+                });
+            });
+
+        egui::CentralPanel::default().show(ui, |ui| {
+            ui.add_space(8.0);
+            Frame::new()
+                .fill(Color32::from_rgb(18, 24, 33))
+                .corner_radius(CornerRadius::same(8))
+                .stroke(Stroke::new(1.0, Color32::from_rgb(39, 51, 67)))
+                .show(ui, |ui| {
+                    ui.set_min_height(ui.available_height() - 76.0);
+                    ScrollArea::vertical()
+                        .stick_to_bottom(true)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.add_space(10.0);
+                            if self.messages.is_empty() {
+                                empty_chat(ui);
+                            } else {
+                                for line in &self.messages {
+                                    chat_line(ui, line);
+                                    ui.add_space(8.0);
+                                }
+                            }
+                            ui.add_space(10.0);
+                        });
+                });
+
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                let response = ui.add_enabled(
+                    self.handle.is_some(),
+                    TextEdit::singleline(&mut self.message_input)
+                        .hint_text("输入消息")
+                        .desired_width(f32::INFINITY),
+                );
+                let send_pressed =
+                    response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+
+                if ui
+                    .add_enabled(
+                        self.handle.is_some(),
+                        egui::Button::new("发送").min_size(Vec2::new(86.0, 32.0)),
+                    )
+                    .clicked()
+                    || send_pressed
+                {
+                    self.send_message();
+                }
+            });
+        });
+    }
+}
+
+impl Drop for P2pChatApp {
+    fn drop(&mut self) {
+        self.close_current_session();
+    }
+}
+
+fn configure_style(ctx: &Context) {
+    configure_fonts(ctx);
+
+    let mut style = (*ctx.style_of(egui::Theme::Dark)).clone();
+    style.spacing.item_spacing = Vec2::new(10.0, 10.0);
+    style.spacing.button_padding = Vec2::new(12.0, 8.0);
+    style.visuals = egui::Visuals::dark();
+    style.visuals.panel_fill = Color32::from_rgb(13, 18, 26);
+    style.visuals.window_fill = Color32::from_rgb(18, 24, 33);
+    style.visuals.widgets.inactive.bg_fill = Color32::from_rgb(30, 39, 52);
+    style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(46, 59, 76);
+    style.visuals.widgets.active.bg_fill = Color32::from_rgb(53, 103, 132);
+    style.visuals.selection.bg_fill = Color32::from_rgb(64, 127, 164);
+    ctx.set_style_of(egui::Theme::Dark, style);
+}
+
+fn configure_fonts(ctx: &Context) {
+    let Some((font_name, font_data)) = load_cjk_font() else {
+        return;
+    };
+
+    let mut fonts = FontDefinitions::default();
+    fonts
+        .font_data
+        .insert(font_name.clone(), FontData::from_owned(font_data).into());
+
+    for family in [FontFamily::Proportional, FontFamily::Monospace] {
+        fonts
+            .families
+            .entry(family)
+            .or_default()
+            .push(font_name.clone());
+    }
+
+    ctx.set_fonts(fonts);
+}
+
+fn load_cjk_font() -> Option<(String, Vec<u8>)> {
+    const CANDIDATES: &[(&str, &str)] = &[
+        (
+            "Arial Unicode",
+            "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        ),
+        ("Arial Unicode", "/Library/Fonts/Arial Unicode.ttf"),
+        ("PingFang", "/System/Library/Fonts/PingFang.ttc"),
+        ("STHeiti", "/System/Library/Fonts/STHeiti Light.ttc"),
+        ("STHeiti", "/System/Library/Fonts/STHeiti Medium.ttc"),
+        ("Microsoft YaHei", r"C:\Windows\Fonts\msyh.ttc"),
+        ("SimSun", r"C:\Windows\Fonts\simsun.ttc"),
+        (
+            "Noto Sans CJK",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        ),
+        (
+            "Noto Sans CJK",
+            "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+        ),
+    ];
+
+    CANDIDATES.iter().find_map(|(name, path)| {
+        std::fs::read(path)
+            .ok()
+            .map(|data| (format!("p2p-cjk-{name}"), data))
+    })
+}
+
+fn status_chip(ui: &mut Ui, state: ConnectionState, text: &str) {
+    let (label, color) = match state {
+        ConnectionState::Idle => ("空闲", Color32::from_rgb(122, 132, 146)),
+        ConnectionState::Connecting => ("连接中", Color32::from_rgb(212, 159, 70)),
+        ConnectionState::Connected => ("已连接", Color32::from_rgb(70, 146, 190)),
+        ConnectionState::Paired => ("已对接", Color32::from_rgb(75, 172, 123)),
+    };
+
+    Frame::new()
+        .fill(Color32::from_rgb(24, 32, 43))
+        .corner_radius(CornerRadius::same(8))
+        .stroke(Stroke::new(1.0, color))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(label).color(color).strong());
+                ui.label(RichText::new(text).color(Color32::from_rgb(188, 197, 208)));
+            });
+        });
+}
+
+fn chat_line(ui: &mut Ui, line: &ChatLine) {
+    match line.author {
+        ChatAuthor::Mine => {
+            ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
+                bubble(ui, "我", &line.text, Color32::from_rgb(48, 106, 138));
+            });
+        }
+        ChatAuthor::Peer => {
+            ui.with_layout(Layout::left_to_right(Align::TOP), |ui| {
+                bubble(ui, "对方", &line.text, Color32::from_rgb(43, 57, 74));
+            });
+        }
+        ChatAuthor::System => {
+            ui.horizontal_centered(|ui| {
+                ui.label(RichText::new(&line.text).color(Color32::from_rgb(146, 157, 171)));
+            });
+        }
+    }
+}
+
+fn bubble(ui: &mut Ui, name: &str, text: &str, color: Color32) {
+    Frame::new()
+        .fill(color)
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(egui::Margin::symmetric(12, 9))
+        .show(ui, |ui| {
+            ui.set_max_width(420.0);
+            ui.label(
+                RichText::new(name)
+                    .small()
+                    .color(Color32::from_rgb(202, 211, 222)),
+            );
+            ui.label(RichText::new(text).color(Color32::WHITE));
+        });
+}
+
+fn empty_chat(ui: &mut Ui) {
+    ui.vertical_centered(|ui| {
+        ui.add_space(180.0);
+        ui.label(RichText::new("创建房间或输入房间号后开始聊天").size(18.0));
+        ui.label(RichText::new("消息会显示在这里").color(Color32::from_rgb(146, 157, 171)));
+    });
+}
+
+fn config_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|dir| dir.join("p2p-signaling").join("gui.json"))
+}
+
+fn load_config(path: &PathBuf) -> Option<StoredConfig> {
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn save_config(path: Option<&PathBuf>, config: &StoredConfig) -> anyhow::Result<()> {
+    let path = path.ok_or_else(|| anyhow::anyhow!("找不到系统配置目录"))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, serde_json::to_string_pretty(config)?)?;
+    Ok(())
 }
 
 fn require_value(flag: &str, value: Option<String>) -> anyhow::Result<String> {
@@ -89,15 +687,50 @@ fn require_value(flag: &str, value: Option<String>) -> anyhow::Result<String> {
         .ok_or_else(|| anyhow::anyhow!("{flag} requires a value"))
 }
 
+fn random_room_code() -> String {
+    static ROOM_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let mut bytes = [0_u8; 2];
+    if getrandom::getrandom(&mut bytes).is_ok() {
+        return format!("{:04}", u16::from_ne_bytes(bytes) % 10_000);
+    }
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos() as u64);
+    let sequence = ROOM_COUNTER.fetch_add(1, Ordering::Relaxed);
+
+    format!("{:04}", now.wrapping_add(sequence) % 10_000)
+}
+
+fn normalize_room_input(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_digit())
+        .take(4)
+        .collect()
+}
+
+fn normalize_room_input_in_place(value: &mut String) {
+    let normalized = normalize_room_input(value);
+    if *value != normalized {
+        *value = normalized;
+    }
+}
+
+fn is_valid_room(room: &str) -> bool {
+    room.len() == 4 && room.chars().all(|character| character.is_ascii_digit())
+}
+
 fn build_signaling_url(server: &str, room: &str) -> anyhow::Result<String> {
     let server = server.trim().trim_end_matches('/');
     let room = room.trim().trim_matches('/');
 
     if server.is_empty() {
-        anyhow::bail!("server must not be empty");
+        anyhow::bail!("信令服务器地址不能为空");
     }
-    if room.is_empty() {
-        anyhow::bail!("room must not be empty");
+    if !is_valid_room(room) {
+        anyhow::bail!("房间号需要 4 位数字");
     }
 
     let url = if server.starts_with("wss://") || server.starts_with("ws://") {
@@ -144,25 +777,32 @@ mod tests {
 
     #[test]
     fn builds_wss_url_from_domain() {
-        let url = build_signaling_url("p2p-signaling.yizhe.studio", "ROOM1").unwrap();
-        assert_eq!(url, "wss://p2p-signaling.yizhe.studio/rooms/ROOM1");
+        let url = build_signaling_url("p2p-signaling.yizhe.studio", "1234").unwrap();
+        assert_eq!(url, "wss://p2p-signaling.yizhe.studio/rooms/1234");
     }
 
     #[test]
     fn builds_ws_url_from_local_ip() {
-        let url = build_signaling_url("127.0.0.1:8787", "ROOM1").unwrap();
-        assert_eq!(url, "ws://127.0.0.1:8787/rooms/ROOM1");
+        let url = build_signaling_url("127.0.0.1:8787", "1234").unwrap();
+        assert_eq!(url, "ws://127.0.0.1:8787/rooms/1234");
     }
 
     #[test]
     fn converts_https_to_wss() {
-        let url = build_signaling_url("https://example.com/", "ROOM1").unwrap();
-        assert_eq!(url, "wss://example.com/rooms/ROOM1");
+        let url = build_signaling_url("https://example.com/", "1234").unwrap();
+        assert_eq!(url, "wss://example.com/rooms/1234");
     }
 
     #[test]
     fn keeps_full_websocket_room_url() {
-        let url = build_signaling_url("wss://example.com/rooms/ROOM2", "ROOM1").unwrap();
-        assert_eq!(url, "wss://example.com/rooms/ROOM2");
+        let url = build_signaling_url("wss://example.com/rooms/5678", "1234").unwrap();
+        assert_eq!(url, "wss://example.com/rooms/5678");
+    }
+
+    #[test]
+    fn room_input_is_digits_only_and_four_chars() {
+        assert_eq!(normalize_room_input("A12-345"), "1234");
+        assert!(is_valid_room("0000"));
+        assert!(!is_valid_room("123"));
     }
 }

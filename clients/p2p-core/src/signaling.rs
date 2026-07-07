@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use futures::{SinkExt, StreamExt};
+use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;

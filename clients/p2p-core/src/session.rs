@@ -11,6 +11,7 @@ pub enum SessionRole {
 
 #[derive(Debug)]
 pub enum SessionEvent {
+    Connected,
     RoomCodeGenerated(String),
     PeerConnected,
     PeerDisconnected,
@@ -68,8 +69,10 @@ impl ChatSession {
                     Ok(SignalingEnvelope::Error { message }) => {
                         let _ = dispatch_events.send(SessionEvent::Error(message)).await;
                     }
-                    Ok(SignalingEnvelope::RoomReady)
-                    | Ok(SignalingEnvelope::Hello { .. })
+                    Ok(SignalingEnvelope::RoomReady) => {
+                        let _ = dispatch_events.send(SessionEvent::Connected).await;
+                    }
+                    Ok(SignalingEnvelope::Hello { .. })
                     | Ok(SignalingEnvelope::Signal { .. })
                     | Ok(SignalingEnvelope::Bye) => {}
                     Err(_) => {

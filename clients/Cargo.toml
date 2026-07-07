@@ -5,3 +5,9 @@ members = [
   "p2p-gui"
 ]
 
+[profile.release]
+codegen-units = 1
+lto = "thin"
+opt-level = "z"
+panic = "abort"
+strip = "symbols"

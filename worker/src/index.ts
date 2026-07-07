@@ -21,7 +21,9 @@ function json(data: unknown, init: ResponseInit = {}): Response {
 }
 
 function createRoomCode(): string {
-  return crypto.randomUUID().slice(0, 8).toUpperCase();
+  const values = new Uint16Array(1);
+  crypto.getRandomValues(values);
+  return String(values[0] % 10000).padStart(4, "0");
 }
 
 function getRoomStub(env: Env, roomCode: string): DurableObjectStub {
@@ -98,6 +100,12 @@ export class RoomObject {
     }
 
     if (envelope.type === "hello") {
+      for (const [peer, role] of this.sessions.entries()) {
+        if (peer !== sender) {
+          sender.send(JSON.stringify({ type: "peer-joined", role }));
+        }
+      }
+
       this.sessions.set(sender, envelope.role);
       this.broadcast(sender, { type: "peer-joined", role: envelope.role });
       return;
