@@ -5,7 +5,7 @@ use crate::signaling::{SignalingClient, SignalingCommand, SignalingEnvelope, Sig
 
 #[derive(Debug, Clone)]
 pub enum SessionRole {
-    Host,
+    Host { room_code: String },
     Guest { room_code: String },
 }
 
@@ -46,7 +46,7 @@ impl ChatSession {
 
         tokio::spawn(async move {
             if let Err(error) = client.connect(command_rx, incoming_tx).await {
-                let _ = events.send(SessionEvent::Error(error.to_string())).await;
+                let _ = events.send(SessionEvent::Error(format!("{error:#}"))).await;
             }
         });
 
@@ -55,7 +55,9 @@ impl ChatSession {
             while let Some(raw) = incoming_rx.recv().await {
                 match serde_json::from_str::<SignalingEnvelope>(&raw) {
                     Ok(SignalingEnvelope::Chat { text }) => {
-                        let _ = dispatch_events.send(SessionEvent::MessageReceived(text)).await;
+                        let _ = dispatch_events
+                            .send(SessionEvent::MessageReceived(text))
+                            .await;
                     }
                     Ok(SignalingEnvelope::PeerJoined { .. }) => {
                         let _ = dispatch_events.send(SessionEvent::PeerConnected).await;
@@ -71,16 +73,18 @@ impl ChatSession {
                     | Ok(SignalingEnvelope::Signal { .. })
                     | Ok(SignalingEnvelope::Bye) => {}
                     Err(_) => {
-                        let _ = dispatch_events.send(SessionEvent::MessageReceived(raw)).await;
+                        let _ = dispatch_events
+                            .send(SessionEvent::MessageReceived(raw))
+                            .await;
                     }
                 }
             }
         });
 
         let hello = match self.role {
-            SessionRole::Host => {
+            SessionRole::Host { room_code } => {
                 event_tx
-                    .send(SessionEvent::RoomCodeGenerated("LOCALHOST".to_string()))
+                    .send(SessionEvent::RoomCodeGenerated(room_code))
                     .await?;
                 SignalingEnvelope::Hello {
                     role: SignalingRole::Host,
