@@ -1,0 +1,10 @@
+[package]
+name = "p2p-gui"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+p2p-core = { path = "../p2p-core" }
+tokio = { version = "1", features = ["full"] }
+
