@@ -10,7 +10,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$RootDir = Resolve-Path (Join-Path $ScriptDir "..")
+$RootDir = (Resolve-Path (Join-Path $ScriptDir "..")).Path
 $ClientDir = Join-Path $RootDir "clients"
 
 Push-Location $ClientDir

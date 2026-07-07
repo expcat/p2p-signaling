@@ -32,6 +32,8 @@ macOS:
 ./scripts/start-client-macos.sh --server p2p-signaling.yizhe.studio --room TESTROOM --role host
 ```
 
+`scripts/start-client-macos.command` is also available for launching from Finder.
+
 Windows PowerShell:
 
 ```powershell
