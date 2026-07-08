@@ -6,7 +6,7 @@ P2P chat/signaling playground with a Cloudflare Worker signaling service and a R
 
 - `worker/`: Cloudflare Workers TypeScript signaling service.
 - `clients/p2p-core/`: Rust core library for signaling and session state.
-- `clients/p2p-gui/`: GUI-facing crate. It currently runs as a CLI shell until a concrete GUI framework is chosen.
+- `clients/p2p-gui/`: Rust `egui` desktop client for chat and resumable file transfer.
 
 ## Local checks
 
@@ -53,3 +53,9 @@ The client also reads these optional environment variables:
 - `P2P_SIGNALING_SERVER`
 - `P2P_SIGNALING_ROOM`
 - `P2P_SIGNALING_ROLE`
+
+## File transfer
+
+After two clients join the same room, click `文件` in the desktop client to send a file. The receiver chooses where to save it, then the client transfers `32 KiB` chunks, acknowledges completed ranges, and stores pending transfer manifests under the system local data directory in `p2p-signaling/transfers`.
+
+If a client disconnects or restarts, rejoin the same room. Pending send and receive manifests are announced again, and only missing chunks are requested. The Worker continues to act only as a room WebSocket relay; it does not store file bytes.

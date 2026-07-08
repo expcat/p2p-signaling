@@ -5,6 +5,8 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
+use crate::transfer::{ChunkRange, FileChunk, FileMetadata};
+
 #[derive(Debug, Clone)]
 pub struct SignalingClient {
     url: String,
@@ -43,6 +45,43 @@ pub enum SignalingEnvelope {
     },
     Chat {
         text: String,
+    },
+    FileOffer {
+        metadata: FileMetadata,
+    },
+    FileAccept {
+        #[serde(rename = "transferId")]
+        transfer_id: String,
+        missing: Vec<ChunkRange>,
+    },
+    FileReject {
+        #[serde(rename = "transferId")]
+        transfer_id: String,
+        reason: String,
+    },
+    FileResume {
+        #[serde(rename = "transferId")]
+        transfer_id: String,
+        missing: Vec<ChunkRange>,
+    },
+    FileChunk {
+        chunk: FileChunk,
+    },
+    FileAck {
+        #[serde(rename = "transferId")]
+        transfer_id: String,
+        received: Vec<ChunkRange>,
+    },
+    FileComplete {
+        #[serde(rename = "transferId")]
+        transfer_id: String,
+        #[serde(rename = "fileHash")]
+        file_hash: String,
+    },
+    FileCancel {
+        #[serde(rename = "transferId")]
+        transfer_id: String,
+        reason: String,
     },
     Error {
         message: String,
