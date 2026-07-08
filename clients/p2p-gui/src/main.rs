@@ -1,5 +1,7 @@
+use std::future::Future;
 use std::path::PathBuf;
-use std::sync::{mpsc as std_mpsc, Arc};
+use std::sync::mpsc as std_mpsc;
+use std::thread::JoinHandle;
 
 use eframe::egui::{
     self, Align, Color32, Context, CornerRadius, FontData, FontDefinitions, FontFamily, FontId,
@@ -8,8 +10,9 @@ use eframe::egui::{
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::runtime::Runtime;
+use tokio::runtime::{Builder, Handle};
 use tokio::sync::mpsc as tokio_mpsc;
+use tokio::sync::oneshot;
 
 use p2p_core::{ChatSession, ChatSessionHandle, SessionEvent, SessionRole};
 
@@ -136,7 +139,7 @@ struct StoredConfig {
 }
 
 struct P2pChatApp {
-    runtime: Arc<Runtime>,
+    runtime: AsyncRuntime,
     server: String,
     room_input: String,
     active_room: Option<String>,
@@ -155,7 +158,7 @@ impl P2pChatApp {
     fn new(cc: &eframe::CreationContext<'_>, initial_config: ClientConfig) -> Self {
         configure_style(&cc.egui_ctx);
 
-        let runtime = Runtime::new().expect("failed to create tokio runtime");
+        let runtime = AsyncRuntime::new().expect("failed to create tokio runtime");
         let (notice_tx, notice_rx) = std_mpsc::channel();
         let config_path = config_path();
         let stored = config_path.as_ref().and_then(load_config);
@@ -169,7 +172,7 @@ impl P2pChatApp {
         };
 
         let mut app = Self {
-            runtime: Arc::new(runtime),
+            runtime,
             server,
             room_input: initial_config.room,
             active_room: None,
@@ -236,8 +239,8 @@ impl P2pChatApp {
 
         let (event_tx, event_rx) = tokio_mpsc::channel::<SessionEvent>(64);
         let session = ChatSession::new(role, signaling_url);
-        match self.runtime.block_on(session.start(event_tx)) {
-            Ok(handle) => {
+        match self.runtime.wait(session.start(event_tx)) {
+            Ok(Ok(handle)) => {
                 self.handle = Some(handle);
                 self.event_rx = Some(event_rx);
                 self.active_room = Some(room.clone());
@@ -246,7 +249,7 @@ impl P2pChatApp {
                 self.status = format!("正在连接房间 {room}");
                 self.push_system(format!("房间 {room} {action}，正在连接信令服务。"));
             }
-            Err(error) => {
+            Ok(Err(error)) | Err(error) => {
                 self.status = format!("{error:#}");
                 self.push_system(format!("连接失败：{error:#}"));
             }
@@ -384,6 +387,81 @@ impl P2pChatApp {
             .as_deref()
             .filter(|room| !room.is_empty())
             .unwrap_or("----")
+    }
+}
+
+struct AsyncRuntime {
+    handle: Handle,
+    shutdown_tx: Option<oneshot::Sender<()>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl AsyncRuntime {
+    fn new() -> anyhow::Result<Self> {
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
+
+        let thread = std::thread::Builder::new()
+            .name("p2p-chat-runtime".into())
+            .spawn(move || {
+                let runtime = match Builder::new_current_thread().enable_io().build() {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(format!("{error:#}")));
+                        return;
+                    }
+                };
+
+                let _ = ready_tx.send(Ok(runtime.handle().clone()));
+                runtime.block_on(async {
+                    let _ = shutdown_rx.await;
+                });
+            })?;
+
+        let handle = ready_rx
+            .recv()
+            .map_err(|error| anyhow::anyhow!("runtime thread failed to start: {error}"))?
+            .map_err(|error| anyhow::anyhow!("failed to create tokio runtime: {error}"))?;
+
+        Ok(Self {
+            handle,
+            shutdown_tx: Some(shutdown_tx),
+            thread: Some(thread),
+        })
+    }
+
+    fn spawn<F>(&self, future: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        std::mem::drop(self.handle.spawn(future));
+    }
+
+    fn wait<F>(&self, future: F) -> anyhow::Result<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let (result_tx, result_rx) = std_mpsc::sync_channel(1);
+        self.spawn(async move {
+            let _ = result_tx.send(future.await);
+        });
+
+        result_rx
+            .recv()
+            .map_err(|error| anyhow::anyhow!("runtime task failed: {error}"))
+    }
+}
+
+impl Drop for AsyncRuntime {
+    fn drop(&mut self) {
+        if let Some(shutdown_tx) = self.shutdown_tx.take() {
+            let _ = shutdown_tx.send(());
+        }
+
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
