@@ -13,17 +13,22 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RootDir = (Resolve-Path (Join-Path $ScriptDir "..")).Path
 $ClientDir = Join-Path $RootDir "clients"
 
+. (Join-Path $ScriptDir "windows-client-common.ps1")
+
 Push-Location $ClientDir
 try {
     if ($Mode -eq "release") {
-        cargo build --release -p p2p-gui
+        Invoke-CargoBuild -CargoArguments @("build", "--release", "-p", "p2p-gui")
         $Binary = Join-Path $ClientDir "target\release\p2p-gui.exe"
     } else {
-        cargo build -p p2p-gui
+        Invoke-CargoBuild -CargoArguments @("build", "-p", "p2p-gui")
         $Binary = Join-Path $ClientDir "target\debug\p2p-gui.exe"
     }
 
     & $Binary --server $Server --room $Room --role $Role
+    if ($LASTEXITCODE -ne 0) {
+        throw "$Binary exited with code $LASTEXITCODE"
+    }
 } finally {
     Pop-Location
 }
