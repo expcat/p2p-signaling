@@ -159,6 +159,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn round_trips_file_offer_metadata() {
+        let message = P2pMessage::FileOffer {
+            metadata: FileMetadata {
+                transfer_id: "file-test".into(),
+                file_name: "sample.bin".into(),
+                file_size: 42,
+                chunk_size: 32768,
+                total_chunks: 1,
+                modified_millis: Some(1_788_888_888_000),
+                sample_hash: "sample".into(),
+                file_hash: "hash".into(),
+            },
+        };
+        let mut bytes = Vec::new();
+
+        write_p2p_message(&mut bytes, &message).await.unwrap();
+
+        let mut cursor = std::io::Cursor::new(bytes);
+        assert_eq!(read_p2p_message(&mut cursor).await.unwrap(), message);
+    }
+
+    #[tokio::test]
     async fn round_trips_file_stream_header() {
         let header = FileStreamHeader {
             transfer_id: "file-test".into(),

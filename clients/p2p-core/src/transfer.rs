@@ -127,7 +127,7 @@ pub struct FileMetadata {
     pub file_size: u64,
     pub chunk_size: u64,
     pub total_chunks: u64,
-    pub modified_millis: Option<u128>,
+    pub modified_millis: Option<u64>,
     pub sample_hash: String,
     pub file_hash: String,
 }
@@ -319,7 +319,7 @@ pub async fn metadata_for_path(path: &Path) -> Result<FileMetadata> {
         .modified()
         .ok()
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_millis());
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok());
     let sample_hash = sample_hash(path, file_size).await?;
     let file_hash = hash_file(path).await?;
     let total_chunks = file_size.div_ceil(DEFAULT_CHUNK_SIZE);
@@ -469,7 +469,7 @@ pub fn part_path(path: &Path) -> PathBuf {
 fn transfer_id_for(
     file_name: &str,
     file_size: u64,
-    modified_millis: Option<u128>,
+    modified_millis: Option<u64>,
     sample_hash: &str,
 ) -> String {
     let seed = format!("{file_name}:{file_size}:{modified_millis:?}:{sample_hash}");
