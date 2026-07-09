@@ -2,13 +2,12 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result};
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use uuid::Uuid;
 
-pub const DEFAULT_CHUNK_SIZE: u64 = 32 * 1024;
+pub const DEFAULT_CHUNK_SIZE: u64 = 256 * 1024;
 pub const MAX_CHUNK_SIZE: u64 = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -220,24 +219,14 @@ impl TransferManifest {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct FileChunk {
-    pub transfer_id: String,
-    pub index: u64,
-    pub offset: u64,
-    pub size: u64,
-    pub hash: String,
-    pub data: String,
-}
-
 #[derive(Debug, Clone)]
-pub struct DecodedChunk {
+pub struct RawChunk {
     pub index: u64,
     pub offset: u64,
     pub bytes: Vec<u8>,
 }
 
+#[derive(Clone)]
 pub struct TransferStore {
     root: PathBuf,
 }
@@ -348,7 +337,7 @@ pub async fn metadata_for_path(path: &Path) -> Result<FileMetadata> {
     })
 }
 
-pub async fn read_chunk(path: &Path, index: u64, chunk_size: u64) -> Result<FileChunk> {
+pub async fn read_chunk(path: &Path, index: u64, chunk_size: u64) -> Result<RawChunk> {
     let mut file = open_chunk_source(path).await?;
     read_chunk_from(&mut file, index, chunk_size).await
 }
@@ -363,7 +352,7 @@ pub async fn read_chunk_from(
     file: &mut tokio::fs::File,
     index: u64,
     chunk_size: u64,
-) -> Result<FileChunk> {
+) -> Result<RawChunk> {
     let offset = index.saturating_mul(chunk_size);
     file.seek(std::io::SeekFrom::Start(offset)).await?;
 
@@ -378,13 +367,10 @@ pub async fn read_chunk_from(
     }
     bytes.truncate(read);
 
-    Ok(FileChunk {
-        transfer_id: String::new(),
+    Ok(RawChunk {
         index,
         offset,
-        size: bytes.len() as u64,
-        hash: sha256_hex(&bytes),
-        data: BASE64.encode(bytes),
+        bytes,
     })
 }
 
@@ -398,7 +384,7 @@ pub async fn open_chunk_sink(path: &Path) -> Result<tokio::fs::File> {
     Ok(options.open(path).await?)
 }
 
-pub async fn write_chunk(path: &Path, chunk: &DecodedChunk, chunk_size: u64) -> Result<()> {
+pub async fn write_chunk(path: &Path, chunk: &RawChunk, chunk_size: u64) -> Result<()> {
     let mut file = open_chunk_sink(path).await?;
     write_chunk_to(&mut file, chunk, chunk_size).await?;
     file.flush().await?;
@@ -407,30 +393,16 @@ pub async fn write_chunk(path: &Path, chunk: &DecodedChunk, chunk_size: u64) -> 
 
 pub async fn write_chunk_to(
     file: &mut tokio::fs::File,
-    chunk: &DecodedChunk,
+    chunk: &RawChunk,
     chunk_size: u64,
 ) -> Result<()> {
     let offset = chunk.index.saturating_mul(chunk_size);
+    if offset != chunk.offset {
+        anyhow::bail!("chunk {} 偏移不匹配", chunk.index);
+    }
     file.seek(std::io::SeekFrom::Start(offset)).await?;
     file.write_all(&chunk.bytes).await?;
     Ok(())
-}
-
-pub fn decode_chunk(chunk: &FileChunk) -> Result<DecodedChunk> {
-    let bytes = BASE64.decode(&chunk.data)?;
-    let actual_hash = sha256_hex(&bytes);
-    if actual_hash != chunk.hash {
-        anyhow::bail!("chunk {} 校验失败", chunk.index);
-    }
-    if bytes.len() as u64 != chunk.size {
-        anyhow::bail!("chunk {} 大小不匹配", chunk.index);
-    }
-
-    Ok(DecodedChunk {
-        index: chunk.index,
-        offset: chunk.offset,
-        bytes,
-    })
 }
 
 pub async fn hash_file(path: &Path) -> Result<String> {
@@ -564,22 +536,6 @@ mod tests {
             set.missing_ranges(8),
             vec![ChunkRange::new(3, 5), ChunkRange::new(7, 8)]
         );
-    }
-
-    #[test]
-    fn chunk_decode_rejects_corrupt_hash() {
-        let mut chunk = FileChunk {
-            transfer_id: "id".into(),
-            index: 0,
-            offset: 0,
-            size: 5,
-            hash: sha256_hex(b"hello"),
-            data: BASE64.encode(b"hello"),
-        };
-
-        assert!(decode_chunk(&chunk).is_ok());
-        chunk.hash = sha256_hex(b"other");
-        assert!(decode_chunk(&chunk).is_err());
     }
 
     #[test]
@@ -728,23 +684,18 @@ mod tests {
         tokio::fs::create_dir_all(&root).await.unwrap();
         let source = root.join("source.bin");
         let output = root.join("output.bin.part");
+        let chunk_size = 32 * 1024;
         let bytes = (0..70_000)
             .map(|value| (value % 251) as u8)
             .collect::<Vec<_>>();
         tokio::fs::write(&source, &bytes).await.unwrap();
 
-        let mut second = read_chunk(&source, 1, DEFAULT_CHUNK_SIZE).await.unwrap();
-        second.transfer_id = "file-test".into();
-        let mut first = read_chunk(&source, 0, DEFAULT_CHUNK_SIZE).await.unwrap();
-        first.transfer_id = "file-test".into();
-        let mut third = read_chunk(&source, 2, DEFAULT_CHUNK_SIZE).await.unwrap();
-        third.transfer_id = "file-test".into();
+        let second = read_chunk(&source, 1, chunk_size).await.unwrap();
+        let first = read_chunk(&source, 0, chunk_size).await.unwrap();
+        let third = read_chunk(&source, 2, chunk_size).await.unwrap();
 
         for chunk in [second, first, third] {
-            let decoded = decode_chunk(&chunk).unwrap();
-            write_chunk(&output, &decoded, DEFAULT_CHUNK_SIZE)
-                .await
-                .unwrap();
+            write_chunk(&output, &chunk, chunk_size).await.unwrap();
         }
 
         assert_eq!(

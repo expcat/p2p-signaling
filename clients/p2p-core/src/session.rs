@@ -1,14 +1,24 @@
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use tokio::sync::mpsc;
+use tokio::io::AsyncWriteExt;
+use tokio::sync::{mpsc, Mutex};
 
 use crate::direct::{establish_direct_link, DirectLink, DirectLinkInfo};
 use crate::nat::{prepare_connect_info, ConnectInfo, PreparedConnectInfo};
-use crate::p2p_proto::{read_p2p_message, write_p2p_message, P2pMessage};
+use crate::p2p_proto::{
+    read_file_stream_header, read_p2p_message, write_file_stream_header, write_p2p_message,
+    FileStreamHeader, P2pMessage,
+};
 use crate::signaling::{SignalingClient, SignalingCommand, SignalingEnvelope, SignalingRole};
-use crate::transfer::{FileMetadata, TransferDirection, TransferStatus};
+use crate::transfer::{
+    hash_file, metadata_for_path, open_chunk_sink, open_chunk_source, part_path, read_chunk_from,
+    validate_offer_metadata, write_chunk_to, ChunkRange, FileMetadata, RangeSet, RawChunk,
+    TransferDirection, TransferManifest, TransferStatus, TransferStore,
+};
 
 #[derive(Debug, Clone)]
 pub enum SessionRole {
@@ -78,12 +88,49 @@ pub struct ChatSessionHandle {
 #[derive(Debug)]
 enum DirectCommand {
     Chat(String),
+    OfferFile(PathBuf),
+    AcceptFile {
+        transfer_id: String,
+        save_path: PathBuf,
+    },
+    RejectFile {
+        transfer_id: String,
+        reason: String,
+    },
+    PauseTransfer(String),
+    ResumeTransfer(String),
+    CancelTransfer {
+        transfer_id: String,
+        reason: String,
+    },
 }
 
 #[derive(Debug)]
 enum SessionCommand {
     RetryDirect,
 }
+
+struct TransferState {
+    store: TransferStore,
+    pending_offers: HashMap<String, FileMetadata>,
+    senders: HashMap<String, TransferManifest>,
+    receivers: HashMap<String, TransferManifest>,
+    cancelled: HashSet<String>,
+}
+
+impl TransferState {
+    fn new(store: TransferStore) -> Self {
+        Self {
+            store,
+            pending_offers: HashMap::new(),
+            senders: HashMap::new(),
+            receivers: HashMap::new(),
+            cancelled: HashSet::new(),
+        }
+    }
+}
+
+type SharedTransferState = Arc<Mutex<TransferState>>;
 
 impl ChatSession {
     pub fn new(role: SessionRole, signaling_url: String) -> Self {
@@ -403,6 +450,17 @@ async fn run_direct_link(
     let mut send = parts.control_send;
     let mut recv = parts.control_recv;
     let mut ping = tokio::time::interval(Duration::from_secs(20));
+    let store = TransferStore::platform_default().unwrap_or_else(|_| {
+        TransferStore::new(std::env::temp_dir().join("p2p-signaling").join("transfers"))
+    });
+    let transfer_state = Arc::new(Mutex::new(TransferState::new(store)));
+    let (outbound_tx, mut outbound_rx) = mpsc::channel::<P2pMessage>(128);
+    let uni_task = spawn_uni_stream_receiver(
+        connection.clone(),
+        transfer_state.clone(),
+        outbound_tx.clone(),
+        event_tx.clone(),
+    );
 
     let _ = event_tx
         .send(SessionEvent::DirectLinkEstablished(info))
@@ -413,9 +471,36 @@ async fn run_direct_link(
             command = command_rx.recv() => {
                 match command {
                     Some(DirectCommand::Chat(text)) => {
-                        if let Err(error) = write_p2p_message(&mut send, &P2pMessage::Chat { text }).await {
-                            let _ = event_tx.send(SessionEvent::DirectLinkLost(format!("{error:#}"))).await;
-                            break;
+                        let _ = outbound_tx.send(P2pMessage::Chat { text }).await;
+                    }
+                    Some(DirectCommand::OfferFile(path)) => {
+                        if let Err(error) = offer_file(path, transfer_state.clone(), outbound_tx.clone(), event_tx.clone()).await {
+                            let _ = event_tx.send(SessionEvent::Error(format!("{error:#}"))).await;
+                        }
+                    }
+                    Some(DirectCommand::AcceptFile { transfer_id, save_path }) => {
+                        if let Err(error) = accept_file_offer(transfer_id, save_path, transfer_state.clone(), outbound_tx.clone(), event_tx.clone()).await {
+                            let _ = event_tx.send(SessionEvent::Error(format!("{error:#}"))).await;
+                        }
+                    }
+                    Some(DirectCommand::RejectFile { transfer_id, reason }) => {
+                        if let Err(error) = reject_file_offer(transfer_id, reason, transfer_state.clone(), outbound_tx.clone(), event_tx.clone()).await {
+                            let _ = event_tx.send(SessionEvent::Error(format!("{error:#}"))).await;
+                        }
+                    }
+                    Some(DirectCommand::PauseTransfer(transfer_id)) => {
+                        if let Err(error) = pause_transfer(transfer_id, transfer_state.clone(), outbound_tx.clone(), event_tx.clone()).await {
+                            let _ = event_tx.send(SessionEvent::Error(format!("{error:#}"))).await;
+                        }
+                    }
+                    Some(DirectCommand::ResumeTransfer(transfer_id)) => {
+                        if let Err(error) = resume_transfer(transfer_id, transfer_state.clone(), outbound_tx.clone(), event_tx.clone()).await {
+                            let _ = event_tx.send(SessionEvent::Error(format!("{error:#}"))).await;
+                        }
+                    }
+                    Some(DirectCommand::CancelTransfer { transfer_id, reason }) => {
+                        if let Err(error) = cancel_transfer(transfer_id, reason, transfer_state.clone(), outbound_tx.clone(), event_tx.clone()).await {
+                            let _ = event_tx.send(SessionEvent::Error(format!("{error:#}"))).await;
                         }
                     }
                     None => {
@@ -424,18 +509,56 @@ async fn run_direct_link(
                     }
                 }
             }
+            outbound = outbound_rx.recv() => {
+                let Some(message) = outbound else {
+                    break;
+                };
+                if let Err(error) = write_p2p_message(&mut send, &message).await {
+                    let _ = event_tx.send(SessionEvent::DirectLinkLost(format!("{error:#}"))).await;
+                    break;
+                }
+            }
             message = read_p2p_message(&mut recv) => {
                 match message {
                     Ok(P2pMessage::Chat { text }) => {
                         let _ = event_tx.send(SessionEvent::MessageReceived(text)).await;
                     }
                     Ok(P2pMessage::Ping) => {
-                        if let Err(error) = write_p2p_message(&mut send, &P2pMessage::Pong).await {
-                            let _ = event_tx.send(SessionEvent::DirectLinkLost(format!("{error:#}"))).await;
-                            break;
-                        }
+                        let _ = outbound_tx.send(P2pMessage::Pong).await;
                     }
                     Ok(P2pMessage::Pong) => {}
+                    Ok(P2pMessage::FileOffer { metadata }) => {
+                        if let Err(error) = receive_file_offer(metadata, transfer_state.clone(), event_tx.clone()).await {
+                            let _ = event_tx.send(SessionEvent::Error(format!("{error:#}"))).await;
+                        }
+                    }
+                    Ok(P2pMessage::FileAccept { transfer_id, completed_chunks })
+                    | Ok(P2pMessage::FileResume { transfer_id, completed_chunks }) => {
+                        start_sending_file(
+                            transfer_id,
+                            completed_chunks,
+                            connection.clone(),
+                            transfer_state.clone(),
+                            outbound_tx.clone(),
+                            event_tx.clone(),
+                        );
+                    }
+                    Ok(P2pMessage::FileReject { transfer_id, reason })
+                    | Ok(P2pMessage::FileCancel { transfer_id, reason }) => {
+                        if let Err(error) = mark_transfer_cancelled(transfer_id, reason, transfer_state.clone(), event_tx.clone()).await {
+                            let _ = event_tx.send(SessionEvent::Error(format!("{error:#}"))).await;
+                        }
+                    }
+                    Ok(P2pMessage::FileAck { transfer_id, chunks }) => {
+                        if let Err(error) = acknowledge_sent_chunks(transfer_id, chunks, transfer_state.clone(), event_tx.clone()).await {
+                            let _ = event_tx.send(SessionEvent::Error(format!("{error:#}"))).await;
+                        }
+                    }
+                    Ok(P2pMessage::FileComplete { transfer_id }) => {
+                        if let Err(error) = complete_sent_transfer(transfer_id, transfer_state.clone(), event_tx.clone()).await {
+                            let _ = event_tx.send(SessionEvent::Error(format!("{error:#}"))).await;
+                        }
+                    }
                     Ok(P2pMessage::Hello { .. }) => {
                         let _ = event_tx
                             .send(SessionEvent::DirectLinkLost("直连控制流收到重复 Hello".into()))
@@ -461,8 +584,737 @@ async fn run_direct_link(
         }
     }
 
+    uni_task.abort();
     connection.close(0_u32.into(), b"direct link stopped");
     endpoint.wait_idle().await;
+}
+
+async fn offer_file(
+    path: PathBuf,
+    state: SharedTransferState,
+    outbound_tx: mpsc::Sender<P2pMessage>,
+    event_tx: mpsc::Sender<SessionEvent>,
+) -> Result<()> {
+    let metadata = metadata_for_path(&path).await?;
+    let manifest = TransferManifest::new_sender(metadata.clone(), path);
+
+    {
+        let mut state = state.lock().await;
+        state.store.save(&manifest).await?;
+        state
+            .senders
+            .insert(manifest.metadata.transfer_id.clone(), manifest.clone());
+        state.cancelled.remove(&manifest.metadata.transfer_id);
+    }
+
+    send_progress(&event_tx, &manifest).await;
+    outbound_tx.send(P2pMessage::FileOffer { metadata }).await?;
+    Ok(())
+}
+
+async fn receive_file_offer(
+    mut metadata: FileMetadata,
+    state: SharedTransferState,
+    event_tx: mpsc::Sender<SessionEvent>,
+) -> Result<()> {
+    validate_offer_metadata(&mut metadata).map_err(anyhow::Error::msg)?;
+    {
+        let mut state = state.lock().await;
+        state
+            .pending_offers
+            .insert(metadata.transfer_id.clone(), metadata.clone());
+    }
+    let _ = event_tx.send(SessionEvent::FileOffered(metadata)).await;
+    Ok(())
+}
+
+async fn accept_file_offer(
+    transfer_id: String,
+    save_path: PathBuf,
+    state: SharedTransferState,
+    outbound_tx: mpsc::Sender<P2pMessage>,
+    event_tx: mpsc::Sender<SessionEvent>,
+) -> Result<()> {
+    let manifest = {
+        let mut state = state.lock().await;
+        let metadata = state
+            .pending_offers
+            .remove(&transfer_id)
+            .ok_or_else(|| anyhow::anyhow!("找不到待接收文件：{transfer_id}"))?;
+        let mut manifest = match state.store.load(&transfer_id).await? {
+            Some(existing)
+                if existing.direction == TransferDirection::Receive
+                    && existing.metadata.file_hash == metadata.file_hash =>
+            {
+                let mut existing = existing;
+                existing.status = TransferStatus::Accepted;
+                existing.output_path = Some(save_path.clone());
+                existing.temp_path = Some(part_path(&save_path));
+                existing
+            }
+            _ => TransferManifest::new_receiver(metadata, save_path),
+        };
+        manifest.status = TransferStatus::Accepted;
+        state.store.save(&manifest).await?;
+        state
+            .receivers
+            .insert(manifest.metadata.transfer_id.clone(), manifest.clone());
+        state.cancelled.remove(&transfer_id);
+        manifest
+    };
+
+    send_progress(&event_tx, &manifest).await;
+
+    if manifest.metadata.total_chunks == 0 {
+        complete_empty_receiver(manifest, state, outbound_tx, event_tx).await?;
+        return Ok(());
+    }
+
+    outbound_tx
+        .send(P2pMessage::FileAccept {
+            transfer_id,
+            completed_chunks: manifest.completed_chunks.clone(),
+        })
+        .await?;
+    Ok(())
+}
+
+async fn complete_empty_receiver(
+    mut manifest: TransferManifest,
+    state: SharedTransferState,
+    outbound_tx: mpsc::Sender<P2pMessage>,
+    event_tx: mpsc::Sender<SessionEvent>,
+) -> Result<()> {
+    let output_path = manifest
+        .output_path
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("接收文件缺少保存路径"))?;
+    if let Some(parent) = output_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    tokio::fs::write(&output_path, []).await?;
+    manifest.status = TransferStatus::Complete;
+    {
+        let mut state = state.lock().await;
+        state.store.save(&manifest).await?;
+        state
+            .receivers
+            .insert(manifest.metadata.transfer_id.clone(), manifest.clone());
+    }
+    send_progress(&event_tx, &manifest).await;
+    let _ = event_tx
+        .send(SessionEvent::FileCompleted {
+            transfer_id: manifest.metadata.transfer_id.clone(),
+            file_name: manifest.metadata.file_name.clone(),
+            path: Some(output_path),
+        })
+        .await;
+    outbound_tx
+        .send(P2pMessage::FileComplete {
+            transfer_id: manifest.metadata.transfer_id,
+        })
+        .await?;
+    Ok(())
+}
+
+async fn reject_file_offer(
+    transfer_id: String,
+    reason: String,
+    state: SharedTransferState,
+    outbound_tx: mpsc::Sender<P2pMessage>,
+    event_tx: mpsc::Sender<SessionEvent>,
+) -> Result<()> {
+    let file_name = {
+        let mut state = state.lock().await;
+        state
+            .pending_offers
+            .remove(&transfer_id)
+            .map(|metadata| metadata.file_name)
+            .unwrap_or_else(|| transfer_id.clone())
+    };
+    let _ = event_tx
+        .send(SessionEvent::FileCancelled {
+            transfer_id: transfer_id.clone(),
+            file_name,
+            reason: reason.clone(),
+        })
+        .await;
+    outbound_tx
+        .send(P2pMessage::FileReject {
+            transfer_id,
+            reason,
+        })
+        .await?;
+    Ok(())
+}
+
+async fn pause_transfer(
+    transfer_id: String,
+    state: SharedTransferState,
+    outbound_tx: mpsc::Sender<P2pMessage>,
+    event_tx: mpsc::Sender<SessionEvent>,
+) -> Result<()> {
+    update_transfer_status(
+        &transfer_id,
+        TransferStatus::Paused,
+        state.clone(),
+        event_tx,
+    )
+    .await?;
+    {
+        let mut state = state.lock().await;
+        state.cancelled.insert(transfer_id.clone());
+    }
+    outbound_tx
+        .send(P2pMessage::FileCancel {
+            transfer_id,
+            reason: "用户暂停".into(),
+        })
+        .await?;
+    Ok(())
+}
+
+async fn resume_transfer(
+    transfer_id: String,
+    state: SharedTransferState,
+    outbound_tx: mpsc::Sender<P2pMessage>,
+    event_tx: mpsc::Sender<SessionEvent>,
+) -> Result<()> {
+    let message = {
+        let mut state = state.lock().await;
+        state.cancelled.remove(&transfer_id);
+        if let Some(manifest) = state.receivers.get_mut(&transfer_id) {
+            manifest.status = TransferStatus::Accepted;
+            let manifest = manifest.clone();
+            state.store.save(&manifest).await?;
+            send_progress(&event_tx, &manifest).await;
+            Some(P2pMessage::FileResume {
+                transfer_id: transfer_id.clone(),
+                completed_chunks: manifest.completed_chunks,
+            })
+        } else if let Some(manifest) = state.senders.get_mut(&transfer_id) {
+            manifest.status = TransferStatus::Offered;
+            let manifest = manifest.clone();
+            state.store.save(&manifest).await?;
+            send_progress(&event_tx, &manifest).await;
+            Some(P2pMessage::FileOffer {
+                metadata: manifest.metadata,
+            })
+        } else {
+            None
+        }
+    };
+
+    let Some(message) = message else {
+        anyhow::bail!("找不到可继续的传输：{transfer_id}");
+    };
+    outbound_tx.send(message).await?;
+    Ok(())
+}
+
+async fn cancel_transfer(
+    transfer_id: String,
+    reason: String,
+    state: SharedTransferState,
+    outbound_tx: mpsc::Sender<P2pMessage>,
+    event_tx: mpsc::Sender<SessionEvent>,
+) -> Result<()> {
+    mark_transfer_cancelled(transfer_id.clone(), reason.clone(), state, event_tx).await?;
+    outbound_tx
+        .send(P2pMessage::FileCancel {
+            transfer_id,
+            reason,
+        })
+        .await?;
+    Ok(())
+}
+
+async fn update_transfer_status(
+    transfer_id: &str,
+    status: TransferStatus,
+    state: SharedTransferState,
+    event_tx: mpsc::Sender<SessionEvent>,
+) -> Result<()> {
+    let manifest = {
+        let mut state = state.lock().await;
+        if let Some(manifest) = state.senders.get_mut(transfer_id) {
+            manifest.status = status.clone();
+            Some(manifest.clone())
+        } else if let Some(manifest) = state.receivers.get_mut(transfer_id) {
+            manifest.status = status;
+            Some(manifest.clone())
+        } else {
+            None
+        }
+    };
+
+    let Some(manifest) = manifest else {
+        anyhow::bail!("找不到传输：{transfer_id}");
+    };
+    {
+        let state = state.lock().await;
+        state.store.save(&manifest).await?;
+    }
+    send_progress(&event_tx, &manifest).await;
+    Ok(())
+}
+
+fn start_sending_file(
+    transfer_id: String,
+    completed_chunks: Vec<ChunkRange>,
+    connection: quinn::Connection,
+    state: SharedTransferState,
+    outbound_tx: mpsc::Sender<P2pMessage>,
+    event_tx: mpsc::Sender<SessionEvent>,
+) {
+    tokio::spawn(async move {
+        if let Err(error) = send_file_ranges(
+            transfer_id.clone(),
+            completed_chunks,
+            connection,
+            state.clone(),
+            outbound_tx.clone(),
+            event_tx.clone(),
+        )
+        .await
+        {
+            let _ = mark_transfer_failed(
+                transfer_id.clone(),
+                format!("{error:#}"),
+                state.clone(),
+                event_tx.clone(),
+            )
+            .await;
+            let _ = outbound_tx
+                .send(P2pMessage::FileCancel {
+                    transfer_id,
+                    reason: format!("{error:#}"),
+                })
+                .await;
+        }
+    });
+}
+
+async fn send_file_ranges(
+    transfer_id: String,
+    completed_chunks: Vec<ChunkRange>,
+    connection: quinn::Connection,
+    state: SharedTransferState,
+    outbound_tx: mpsc::Sender<P2pMessage>,
+    event_tx: mpsc::Sender<SessionEvent>,
+) -> Result<()> {
+    let (manifest, source_path, missing_ranges) = {
+        let mut state = state.lock().await;
+        state.cancelled.remove(&transfer_id);
+        let manifest = state
+            .senders
+            .get_mut(&transfer_id)
+            .ok_or_else(|| anyhow::anyhow!("找不到待发送文件：{transfer_id}"))?;
+        manifest.status = TransferStatus::Accepted;
+        let source_path = manifest
+            .source_path
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("发送文件缺少源路径"))?;
+        let remote_completed = RangeSet::from_ranges(completed_chunks);
+        let missing_ranges = remote_completed.missing_ranges(manifest.metadata.total_chunks);
+        let manifest = manifest.clone();
+        state.store.save(&manifest).await?;
+        (manifest, source_path, missing_ranges)
+    };
+
+    send_progress(&event_tx, &manifest).await;
+
+    if missing_ranges.is_empty() {
+        outbound_tx
+            .send(P2pMessage::FileComplete {
+                transfer_id: transfer_id.clone(),
+            })
+            .await?;
+        return Ok(());
+    }
+
+    let mut source = open_chunk_source(&source_path).await?;
+    for range in missing_ranges {
+        ensure_not_cancelled(&transfer_id, &state).await?;
+        let mut stream = connection.open_uni().await?;
+        write_file_stream_header(
+            &mut stream,
+            &FileStreamHeader {
+                transfer_id: transfer_id.clone(),
+                start_chunk: range.start,
+                end_chunk: range.end,
+            },
+        )
+        .await?;
+
+        for index in range.start..range.end {
+            ensure_not_cancelled(&transfer_id, &state).await?;
+            let chunk = read_chunk_from(&mut source, index, manifest.metadata.chunk_size).await?;
+            stream.write_all(&chunk.bytes).await?;
+            let _ = event_tx
+                .send(SessionEvent::FileProgress(FileTransferProgress {
+                    transfer_id: transfer_id.clone(),
+                    file_name: manifest.metadata.file_name.clone(),
+                    direction: TransferDirection::Send,
+                    status: TransferStatus::Accepted,
+                    completed_bytes: (chunk.offset + chunk.bytes.len() as u64)
+                        .min(manifest.metadata.file_size),
+                    total_bytes: manifest.metadata.file_size,
+                }))
+                .await;
+        }
+        stream.finish()?;
+    }
+
+    Ok(())
+}
+
+async fn ensure_not_cancelled(transfer_id: &str, state: &SharedTransferState) -> Result<()> {
+    if state.lock().await.cancelled.contains(transfer_id) {
+        anyhow::bail!("传输已暂停或取消：{transfer_id}");
+    }
+    Ok(())
+}
+
+fn spawn_uni_stream_receiver(
+    connection: quinn::Connection,
+    state: SharedTransferState,
+    outbound_tx: mpsc::Sender<P2pMessage>,
+    event_tx: mpsc::Sender<SessionEvent>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let stream = match connection.accept_uni().await {
+                Ok(stream) => stream,
+                Err(_) => break,
+            };
+            tokio::spawn(receive_file_stream(
+                stream,
+                state.clone(),
+                outbound_tx.clone(),
+                event_tx.clone(),
+            ));
+        }
+    })
+}
+
+async fn receive_file_stream(
+    mut stream: quinn::RecvStream,
+    state: SharedTransferState,
+    outbound_tx: mpsc::Sender<P2pMessage>,
+    event_tx: mpsc::Sender<SessionEvent>,
+) {
+    if let Err(error) = receive_file_stream_inner(
+        &mut stream,
+        state.clone(),
+        outbound_tx.clone(),
+        event_tx.clone(),
+    )
+    .await
+    {
+        let _ = event_tx
+            .send(SessionEvent::Error(format!("接收文件流失败：{error:#}")))
+            .await;
+    }
+}
+
+async fn receive_file_stream_inner(
+    stream: &mut quinn::RecvStream,
+    state: SharedTransferState,
+    outbound_tx: mpsc::Sender<P2pMessage>,
+    event_tx: mpsc::Sender<SessionEvent>,
+) -> Result<()> {
+    let header = read_file_stream_header(stream).await?;
+    if header.start_chunk >= header.end_chunk {
+        anyhow::bail!("文件流分块范围无效");
+    }
+
+    let manifest = {
+        let state = state.lock().await;
+        state
+            .receivers
+            .get(&header.transfer_id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("收到未接受的文件流：{}", header.transfer_id))?
+    };
+    if header.end_chunk > manifest.metadata.total_chunks {
+        anyhow::bail!("文件流分块范围越界");
+    }
+
+    let temp_path = manifest
+        .temp_path
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("接收文件缺少临时路径"))?;
+    let mut sink = open_chunk_sink(&temp_path).await?;
+
+    for index in header.start_chunk..header.end_chunk {
+        ensure_not_cancelled(&header.transfer_id, &state).await?;
+        let expected_len = expected_chunk_len(&manifest.metadata, index)?;
+        let offset = index.saturating_mul(manifest.metadata.chunk_size);
+        let mut bytes = vec![0_u8; expected_len];
+        stream.read_exact(&mut bytes).await?;
+        write_chunk_to(
+            &mut sink,
+            &RawChunk {
+                index,
+                offset,
+                bytes,
+            },
+            manifest.metadata.chunk_size,
+        )
+        .await?;
+
+        let updated = record_received_chunk(&header.transfer_id, index, state.clone()).await?;
+        send_progress(&event_tx, &updated).await;
+        outbound_tx
+            .send(P2pMessage::FileAck {
+                transfer_id: header.transfer_id.clone(),
+                chunks: vec![ChunkRange::new(index, index + 1)],
+            })
+            .await?;
+    }
+
+    sink.flush().await?;
+    finalize_received_transfer(header.transfer_id, state, outbound_tx, event_tx).await?;
+    Ok(())
+}
+
+fn expected_chunk_len(metadata: &FileMetadata, index: u64) -> Result<usize> {
+    if index >= metadata.total_chunks {
+        anyhow::bail!("chunk {index} 超出文件范围");
+    }
+    let offset = index.saturating_mul(metadata.chunk_size);
+    let remaining = metadata.file_size.saturating_sub(offset);
+    Ok(remaining.min(metadata.chunk_size) as usize)
+}
+
+async fn record_received_chunk(
+    transfer_id: &str,
+    index: u64,
+    state: SharedTransferState,
+) -> Result<TransferManifest> {
+    let mut state = state.lock().await;
+    let manifest = state
+        .receivers
+        .get_mut(transfer_id)
+        .ok_or_else(|| anyhow::anyhow!("找不到接收中的文件：{transfer_id}"))?;
+    let mut completed = manifest.completed_set();
+    completed.insert(index);
+    manifest.completed_chunks = completed.into_ranges();
+    manifest.status = TransferStatus::Accepted;
+    let manifest = manifest.clone();
+    state.store.save(&manifest).await?;
+    Ok(manifest)
+}
+
+async fn finalize_received_transfer(
+    transfer_id: String,
+    state: SharedTransferState,
+    outbound_tx: mpsc::Sender<P2pMessage>,
+    event_tx: mpsc::Sender<SessionEvent>,
+) -> Result<()> {
+    let manifest = {
+        let state = state.lock().await;
+        let Some(manifest) = state.receivers.get(&transfer_id) else {
+            return Ok(());
+        };
+        if manifest.status == TransferStatus::Complete || !manifest.is_complete() {
+            return Ok(());
+        }
+        manifest.clone()
+    };
+
+    let temp_path = manifest
+        .temp_path
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("接收文件缺少临时路径"))?;
+    let output_path = manifest
+        .output_path
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("接收文件缺少保存路径"))?;
+    let actual_hash = hash_file(&temp_path).await?;
+    if actual_hash != manifest.metadata.file_hash {
+        mark_transfer_failed(
+            transfer_id.clone(),
+            "文件哈希校验失败".into(),
+            state,
+            event_tx,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    if tokio::fs::try_exists(&output_path).await? {
+        tokio::fs::remove_file(&output_path).await?;
+    }
+    tokio::fs::rename(&temp_path, &output_path).await?;
+
+    let completed = {
+        let mut state = state.lock().await;
+        let manifest = state
+            .receivers
+            .get_mut(&transfer_id)
+            .ok_or_else(|| anyhow::anyhow!("找不到接收中的文件：{transfer_id}"))?;
+        manifest.status = TransferStatus::Complete;
+        let manifest = manifest.clone();
+        state.store.save(&manifest).await?;
+        manifest
+    };
+
+    send_progress(&event_tx, &completed).await;
+    let _ = event_tx
+        .send(SessionEvent::FileCompleted {
+            transfer_id: transfer_id.clone(),
+            file_name: completed.metadata.file_name.clone(),
+            path: Some(output_path),
+        })
+        .await;
+    outbound_tx
+        .send(P2pMessage::FileComplete { transfer_id })
+        .await?;
+    Ok(())
+}
+
+async fn acknowledge_sent_chunks(
+    transfer_id: String,
+    chunks: Vec<ChunkRange>,
+    state: SharedTransferState,
+    event_tx: mpsc::Sender<SessionEvent>,
+) -> Result<()> {
+    let manifest = {
+        let mut state = state.lock().await;
+        let manifest = state
+            .senders
+            .get_mut(&transfer_id)
+            .ok_or_else(|| anyhow::anyhow!("找不到发送中的文件：{transfer_id}"))?;
+        let mut completed = manifest.completed_set();
+        for range in chunks {
+            completed.insert_range(range);
+        }
+        manifest.completed_chunks = completed.into_ranges();
+        manifest.status = TransferStatus::Accepted;
+        let manifest = manifest.clone();
+        state.store.save(&manifest).await?;
+        manifest
+    };
+    send_progress(&event_tx, &manifest).await;
+    Ok(())
+}
+
+async fn complete_sent_transfer(
+    transfer_id: String,
+    state: SharedTransferState,
+    event_tx: mpsc::Sender<SessionEvent>,
+) -> Result<()> {
+    let manifest = {
+        let mut state = state.lock().await;
+        let manifest = state
+            .senders
+            .get_mut(&transfer_id)
+            .ok_or_else(|| anyhow::anyhow!("找不到发送中的文件：{transfer_id}"))?;
+        manifest.status = TransferStatus::Complete;
+        let manifest = manifest.clone();
+        state.store.save(&manifest).await?;
+        manifest
+    };
+    send_progress(&event_tx, &manifest).await;
+    let _ = event_tx
+        .send(SessionEvent::FileCompleted {
+            transfer_id,
+            file_name: manifest.metadata.file_name.clone(),
+            path: manifest.source_path.clone(),
+        })
+        .await;
+    Ok(())
+}
+
+async fn mark_transfer_cancelled(
+    transfer_id: String,
+    reason: String,
+    state: SharedTransferState,
+    event_tx: mpsc::Sender<SessionEvent>,
+) -> Result<()> {
+    let manifest = {
+        let mut state = state.lock().await;
+        state.cancelled.insert(transfer_id.clone());
+        state.pending_offers.remove(&transfer_id);
+        if let Some(manifest) = state.senders.get_mut(&transfer_id) {
+            manifest.status = TransferStatus::Cancelled;
+            Some(manifest.clone())
+        } else if let Some(manifest) = state.receivers.get_mut(&transfer_id) {
+            manifest.status = TransferStatus::Cancelled;
+            Some(manifest.clone())
+        } else {
+            None
+        }
+    };
+
+    if let Some(manifest) = manifest {
+        {
+            let state = state.lock().await;
+            state.store.save(&manifest).await?;
+        }
+        send_progress(&event_tx, &manifest).await;
+        let _ = event_tx
+            .send(SessionEvent::FileCancelled {
+                transfer_id,
+                file_name: manifest.metadata.file_name,
+                reason,
+            })
+            .await;
+    }
+    Ok(())
+}
+
+async fn mark_transfer_failed(
+    transfer_id: String,
+    message: String,
+    state: SharedTransferState,
+    event_tx: mpsc::Sender<SessionEvent>,
+) -> Result<()> {
+    let manifest = {
+        let mut state = state.lock().await;
+        if let Some(manifest) = state.senders.get_mut(&transfer_id) {
+            manifest.status = TransferStatus::Failed;
+            manifest.failure = Some(message.clone());
+            Some(manifest.clone())
+        } else if let Some(manifest) = state.receivers.get_mut(&transfer_id) {
+            manifest.status = TransferStatus::Failed;
+            manifest.failure = Some(message.clone());
+            Some(manifest.clone())
+        } else {
+            None
+        }
+    };
+
+    if let Some(manifest) = manifest {
+        {
+            let state = state.lock().await;
+            state.store.save(&manifest).await?;
+        }
+        send_progress(&event_tx, &manifest).await;
+        let _ = event_tx
+            .send(SessionEvent::FileFailed {
+                transfer_id,
+                file_name: manifest.metadata.file_name,
+                message,
+            })
+            .await;
+    }
+    Ok(())
+}
+
+async fn send_progress(event_tx: &mpsc::Sender<SessionEvent>, manifest: &TransferManifest) {
+    let _ = event_tx
+        .send(SessionEvent::FileProgress(FileTransferProgress {
+            transfer_id: manifest.metadata.transfer_id.clone(),
+            file_name: manifest.metadata.file_name.clone(),
+            direction: manifest.direction.clone(),
+            status: manifest.status.clone(),
+            completed_bytes: manifest.completed_bytes(),
+            total_bytes: manifest.metadata.file_size,
+        }))
+        .await;
 }
 
 impl ChatSessionHandle {
@@ -477,33 +1329,52 @@ impl ChatSessionHandle {
     }
 
     pub async fn send_file(&self, path: PathBuf) -> Result<()> {
-        let _ = path;
-        anyhow::bail!("文件传输将在 Phase 5 接入 QUIC，当前不会回退到 Worker 中继")
+        self.direct_tx.send(DirectCommand::OfferFile(path)).await?;
+        Ok(())
     }
 
     pub async fn accept_file(&self, transfer_id: String, save_path: PathBuf) -> Result<()> {
-        let _ = (transfer_id, save_path);
-        anyhow::bail!("文件传输将在 Phase 5 接入 QUIC")
+        self.direct_tx
+            .send(DirectCommand::AcceptFile {
+                transfer_id,
+                save_path,
+            })
+            .await?;
+        Ok(())
     }
 
     pub async fn reject_file(&self, transfer_id: String, reason: String) -> Result<()> {
-        let _ = (transfer_id, reason);
-        anyhow::bail!("文件传输将在 Phase 5 接入 QUIC")
+        self.direct_tx
+            .send(DirectCommand::RejectFile {
+                transfer_id,
+                reason,
+            })
+            .await?;
+        Ok(())
     }
 
     pub async fn pause_transfer(&self, transfer_id: String) -> Result<()> {
-        let _ = transfer_id;
-        anyhow::bail!("文件传输将在 Phase 5 接入 QUIC")
+        self.direct_tx
+            .send(DirectCommand::PauseTransfer(transfer_id))
+            .await?;
+        Ok(())
     }
 
     pub async fn resume_transfer(&self, transfer_id: String) -> Result<()> {
-        let _ = transfer_id;
-        anyhow::bail!("文件传输将在 Phase 5 接入 QUIC")
+        self.direct_tx
+            .send(DirectCommand::ResumeTransfer(transfer_id))
+            .await?;
+        Ok(())
     }
 
     pub async fn cancel_transfer(&self, transfer_id: String, reason: String) -> Result<()> {
-        let _ = (transfer_id, reason);
-        anyhow::bail!("文件传输将在 Phase 5 接入 QUIC")
+        self.direct_tx
+            .send(DirectCommand::CancelTransfer {
+                transfer_id,
+                reason,
+            })
+            .await?;
+        Ok(())
     }
 
     pub async fn close(&self) -> Result<()> {

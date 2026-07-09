@@ -389,7 +389,26 @@ impl P2pChatApp {
     }
 
     fn choose_and_send_file(&mut self) {
-        self.push_system("文件传输将在 Phase 5 接入 QUIC，当前不会回退到 Worker 中继。");
+        let Some(handle) = self.handle.clone() else {
+            self.push_system("请先创建或加入房间。");
+            return;
+        };
+
+        if self.state != ConnectionState::Direct {
+            self.push_system("请等待直连建立后再发送文件。");
+            return;
+        }
+
+        let Some(path) = rfd::FileDialog::new().pick_file() else {
+            return;
+        };
+        self.push_system(format!("准备发送文件：{}", display_file_name(&path)));
+        let notifier = self.notifier.clone();
+        self.runtime.spawn(async move {
+            if let Err(error) = handle.send_file(path).await {
+                notifier.error(format!("发送文件失败：{error:#}"));
+            }
+        });
     }
 
     fn accept_file_offer(&mut self, metadata: FileMetadata) {
@@ -1009,7 +1028,7 @@ impl eframe::App for P2pChatApp {
 
                 if ui
                     .add_enabled(
-                        self.handle.is_some(),
+                        can_send,
                         egui::Button::new("文件").min_size(Vec2::new(76.0, 32.0)),
                     )
                     .clicked()
@@ -1294,6 +1313,14 @@ fn format_bytes(bytes: u64) -> String {
     } else {
         format!("{value:.1} {}", UNITS[unit])
     }
+}
+
+fn display_file_name(path: &std::path::Path) -> String {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 fn format_connect_info(label: &str, info: &ConnectInfo) -> String {
