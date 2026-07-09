@@ -1406,7 +1406,41 @@ fn empty_chat(ui: &mut Ui) {
 }
 
 fn config_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|dir| dir.join("p2p-signaling").join("gui.json"))
+    config_dir().map(|dir| dir.join("p2p-signaling").join("gui.json"))
+}
+
+#[cfg(target_os = "windows")]
+fn config_dir() -> Option<PathBuf> {
+    env_path("APPDATA").or_else(|| env_path("LOCALAPPDATA"))
+}
+
+#[cfg(target_os = "macos")]
+fn config_dir() -> Option<PathBuf> {
+    home_dir().map(|home| home.join("Library").join("Application Support"))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn config_dir() -> Option<PathBuf> {
+    env_path("XDG_CONFIG_HOME").or_else(|| home_dir().map(|home| home.join(".config")))
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos", unix)))]
+fn config_dir() -> Option<PathBuf> {
+    None
+}
+
+fn env_path(key: &str) -> Option<PathBuf> {
+    let value = std::env::var_os(key)?;
+    if value.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(value))
+    }
+}
+
+#[cfg(any(target_os = "macos", all(unix, not(target_os = "macos"))))]
+fn home_dir() -> Option<PathBuf> {
+    env_path("HOME")
 }
 
 fn load_config(path: &PathBuf) -> Option<StoredConfig> {

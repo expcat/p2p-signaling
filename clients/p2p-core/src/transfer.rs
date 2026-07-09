@@ -220,8 +220,7 @@ pub struct TransferStore {
 
 impl TransferStore {
     pub fn platform_default() -> Result<Self> {
-        let root = dirs::data_local_dir()
-            .or_else(dirs::data_dir)
+        let root = crate::platform_dirs::data_dir()
             .ok_or_else(|| anyhow::anyhow!("找不到本地数据目录"))?
             .join("p2p-signaling")
             .join("transfers");

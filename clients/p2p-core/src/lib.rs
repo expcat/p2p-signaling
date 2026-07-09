@@ -5,6 +5,8 @@ pub mod session;
 pub mod signaling;
 pub mod transfer;
 
+mod platform_dirs;
+
 pub use direct::DirectLinkInfo;
 pub use nat::{Candidate, CandidateKind, ConnectInfo, ConnectInfoKind};
 pub use session::{
