@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use quinn::crypto::rustls::QuicClientConfig;
 use quinn::rustls::client::danger::{
     HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
@@ -10,7 +11,7 @@ use quinn::rustls::client::danger::{
 use quinn::rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use quinn::rustls::{self, CertificateError, DigitallySignedStruct, SignatureScheme};
 use sha2::{Digest, Sha256};
-use tokio::time::{timeout, Instant};
+use tokio::time::timeout;
 
 use crate::nat::{Candidate, CandidateKind, PreparedConnectInfo};
 use crate::p2p_proto::{read_p2p_message, write_p2p_message, P2pMessage};
@@ -119,51 +120,72 @@ async fn dial_direct_link(
     endpoint.set_default_client_config(client_config(peer.cert_hash.clone())?);
     let punch_task = start_punch_loop(punch_socket, peer.candidates.clone())?;
 
-    let deadline = Instant::now() + CONNECT_TIMEOUT;
-    let mut last_error = None;
+    let dial_result = timeout(
+        CONNECT_TIMEOUT,
+        dial_candidates(
+            &endpoint,
+            candidates,
+            &local.info.pairing_token,
+            &peer.pairing_token,
+        ),
+    )
+    .await;
+    punch_task.abort();
+    let (connection, control_send, control_recv) = dial_result.context("直连建立超时")??;
+    let info = DirectLinkInfo {
+        remote_addr: connection.remote_address(),
+        local_role: SignalingRole::Guest,
+    };
+
+    Ok(DirectLink {
+        connection,
+        endpoint,
+        control_send,
+        control_recv,
+        info,
+    })
+}
+
+async fn dial_candidates(
+    endpoint: &quinn::Endpoint,
+    candidates: Vec<Candidate>,
+    local_token: &str,
+    peer_token: &str,
+) -> Result<(quinn::Connection, quinn::SendStream, quinn::RecvStream)> {
+    let mut attempts = FuturesUnordered::new();
     for candidate in candidates {
-        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            break;
-        };
+        attempts.push(dial_candidate(endpoint, candidate, local_token, peer_token));
+    }
 
-        let attempt = async {
-            let connecting = endpoint
-                .connect(candidate.addr, SERVER_NAME)
-                .with_context(|| format!("无法拨号 {}", candidate.addr))?;
-            let connection = connecting
-                .await
-                .with_context(|| format!("QUIC 握手失败 {}", candidate.addr))?;
-            let (control_send, control_recv) =
-                verify_guest_control(&connection, &local.info.pairing_token, &peer.pairing_token)
-                    .await?;
-            Ok::<_, anyhow::Error>((connection, control_send, control_recv))
-        };
-
-        match timeout(remaining, attempt).await {
-            Ok(Ok((connection, control_send, control_recv))) => {
-                punch_task.abort();
-                let info = DirectLinkInfo {
-                    remote_addr: connection.remote_address(),
-                    local_role: SignalingRole::Guest,
-                };
-                return Ok(DirectLink {
-                    connection,
-                    endpoint,
-                    control_send,
-                    control_recv,
-                    info,
-                });
-            }
-            Ok(Err(error)) => last_error = Some(error),
-            Err(error) => last_error = Some(error.into()),
+    let mut last_error = None;
+    while let Some(result) = attempts.next().await {
+        match result {
+            Ok(connection) => return Ok(connection),
+            Err(error) => last_error = Some(error),
         }
     }
 
-    punch_task.abort();
     match last_error {
         Some(error) => Err(error).context("直连建立失败"),
         None => anyhow::bail!("直连建立超时"),
     }
+}
+
+async fn dial_candidate(
+    endpoint: &quinn::Endpoint,
+    candidate: Candidate,
+    local_token: &str,
+    peer_token: &str,
+) -> Result<(quinn::Connection, quinn::SendStream, quinn::RecvStream)> {
+    let connecting = endpoint
+        .connect(candidate.addr, SERVER_NAME)
+        .with_context(|| format!("无法拨号 {}", candidate.addr))?;
+    let connection = connecting
+        .await
+        .with_context(|| format!("QUIC 握手失败 {}", candidate.addr))?;
+    let (control_send, control_recv) =
+        verify_guest_control(&connection, local_token, peer_token).await?;
+    Ok((connection, control_send, control_recv))
 }
 
 fn endpoint(
