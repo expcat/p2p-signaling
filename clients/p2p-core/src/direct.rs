@@ -367,4 +367,3 @@ impl ServerCertVerifier for CertHashVerifier {
             .supported_schemes()
     }
 }
-

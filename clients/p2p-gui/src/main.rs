@@ -876,10 +876,7 @@ impl eframe::App for P2pChatApp {
                 ui.label(RichText::new("房间").strong());
                 ui.add_space(6.0);
                 let room_label = self.room_label().to_string();
-                let active_room = self
-                    .active_room
-                    .clone()
-                    .filter(|room| !room.is_empty());
+                let active_room = self.active_room.clone().filter(|room| !room.is_empty());
                 let mut copied_room = None;
                 let mut disconnect_clicked = false;
                 ui.horizontal(|ui| {
@@ -1076,15 +1073,25 @@ impl Drop for P2pChatApp {
 fn configure_style(ctx: &Context) {
     configure_fonts(ctx);
 
+    ctx.set_theme(egui::Theme::Dark);
     let mut style = (*ctx.style_of(egui::Theme::Dark)).clone();
     style.spacing.item_spacing = Vec2::new(10.0, 10.0);
     style.spacing.button_padding = Vec2::new(12.0, 8.0);
     style.visuals = egui::Visuals::dark();
     style.visuals.panel_fill = Color32::from_rgb(13, 18, 26);
     style.visuals.window_fill = Color32::from_rgb(18, 24, 33);
+    style.visuals.extreme_bg_color = Color32::from_rgb(10, 15, 22);
+    style.visuals.faint_bg_color = Color32::from_rgb(24, 32, 43);
+    style.visuals.weak_text_color = Some(Color32::from_rgb(150, 161, 176));
+    style.visuals.widgets.noninteractive.fg_stroke.color = Color32::from_rgb(218, 226, 235);
+    style.visuals.widgets.noninteractive.bg_stroke =
+        Stroke::new(1.0, Color32::from_rgb(39, 51, 67));
     style.visuals.widgets.inactive.bg_fill = Color32::from_rgb(30, 39, 52);
+    style.visuals.widgets.inactive.fg_stroke.color = Color32::from_rgb(225, 231, 239);
     style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(46, 59, 76);
+    style.visuals.widgets.hovered.fg_stroke.color = Color32::WHITE;
     style.visuals.widgets.active.bg_fill = Color32::from_rgb(53, 103, 132);
+    style.visuals.widgets.active.fg_stroke.color = Color32::WHITE;
     style.visuals.selection.bg_fill = Color32::from_rgb(64, 127, 164);
     ctx.set_style_of(egui::Theme::Dark, style);
 }
