@@ -163,8 +163,8 @@ JSON 便于调试且复用 serde；长度前缀使得单个消息类型日后切
 
 | 阶段 | 内容 | 验收标准 | 状态 |
 |---|---|---|---|
-| **Phase 1** | **服务器分配房间码**：`/rooms/new` 路由 + DO claim 重试；`hostPresent` 门禁（无房主的码不可加入）；`room-ready` 携带 `roomCode`；客户端删除本地 `random_room_code`，从事件获取服务器码 | 房主看到服务器返回的码；访客加入不存在的码收到明确报错；第三客户端 409 | ✅ 本次 |
-| **Phase 2** | **候选收集与交换**：`p2p-core/src/nat.rs` 手写最小 STUN Binding 客户端（单一消息类型 ~150 行，不引依赖）+ 本机网卡枚举；STUN 列表可配置（`P2P_STUN_SERVERS`，默认含大陆可达服务器，Google/Cloudflare 兜底，2-3 个并发查询取最先应答）；`ConnectInfo` 定义与收发（替换 `session.rs` 中对 `Signal` 的丢弃） | 两端在不同网络/同一局域网下能互相打印对方候选列表 | 待做 |
+| **Phase 1** | **服务器分配房间码**：`/rooms/new` 路由 + DO claim 重试；`hostPresent` 门禁（无房主的码不可加入）；`room-ready` 携带 `roomCode`；客户端删除本地 `random_room_code`，从事件获取服务器码 | 房主看到服务器返回的码；访客加入不存在的码收到明确报错；第三客户端 409 | ✅ 已完成 |
+| **Phase 2** | **候选收集与交换**：`p2p-core/src/nat.rs` 手写最小 STUN Binding 客户端（单一消息类型，不引入 STUN 依赖）+ 本机网卡枚举；STUN 列表可配置（`P2P_STUN_SERVERS`，默认含大陆可达服务器，Google/Cloudflare 兜底，最多 3 个并发查询取应答）；`ConnectInfo` 定义与收发（替换 `session.rs` 中对 `Signal` 的丢弃） | 两端在不同网络/同一局域网下能互相打印对方候选列表 | ✅ 本次 |
 | **Phase 3** | **打洞 + QUIC 通道**：`p2p-core/src/direct.rs`——共享 UDP socket、打洞循环、quinn Endpoint（房主 accept / 访客 dial）、rcgen 自签证书 + 哈希锁定、pairing token 校验；事件 `DirectLinkEstablished / Failed / Lost`。新增依赖：`quinn`（**rustls-ring** feature，禁用 aws-lc-rs 以免 Windows 构建依赖 NASM/CMake）、`rcgen`；现有 WebSocket 的 native-tls 不变 | 同局域网与两个典型家用 NAT 之间直连成功；失败路径 10s 内干净超时报错 | 待做 |
 | **Phase 4** | **聊天走直连 + UI 状态**：`p2p-core/src/p2p_proto.rs` 帧协议、Hello/Ping/Pong/Chat；聊天发送切换到 QUIC；`ConnectionState` 增加 `Direct`（绿色「直连」徽标）与失败态；「重试直连」按钮 | 直连模式下 Worker 零聊天帧经过（可用中继计数验证）；断网观察到明确的失败提示 | 待做 |
 | **Phase 5** | **文件传输迁移 QUIC**：分块走二进制 uni-stream，控制消息并入 `P2pMessage`，中继路径退役 | 大文件传输成功且续传逻辑不回归 | 待做 |

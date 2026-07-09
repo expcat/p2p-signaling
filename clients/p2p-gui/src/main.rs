@@ -14,7 +14,10 @@ use tokio::sync::mpsc as tokio_mpsc;
 use tokio::sync::oneshot;
 
 use p2p_core::transfer::{FileMetadata, TransferDirection, TransferStatus};
-use p2p_core::{ChatSession, ChatSessionHandle, FileTransferProgress, SessionEvent, SessionRole};
+use p2p_core::{
+    CandidateKind, ChatSession, ChatSessionHandle, ConnectInfo, FileTransferProgress, SessionEvent,
+    SessionRole,
+};
 
 const DEFAULT_SERVER: &str = "p2p-signaling.yizhe.studio";
 const DEFAULT_ROOM: &str = "";
@@ -600,6 +603,13 @@ impl P2pChatApp {
                         self.push_system(format!("服务器已分配房间号：{room}"));
                     }
                     self.active_room = Some(room);
+                }
+                SessionEvent::LocalCandidatesCollected(info) => {
+                    self.push_system(format_connect_info("本端候选", &info));
+                }
+                SessionEvent::PeerCandidatesReceived(info) => {
+                    self.mark_peer_available(None);
+                    self.push_system(format_connect_info("对端候选", &info));
                 }
                 SessionEvent::PeerConnected => {
                     self.mark_peer_available(Some("另一客户端已加入房间。"));
@@ -1261,6 +1271,33 @@ fn format_bytes(bytes: u64) -> String {
         format!("{bytes} {}", UNITS[unit])
     } else {
         format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+fn format_connect_info(label: &str, info: &ConnectInfo) -> String {
+    let candidates = if info.candidates.is_empty() {
+        "无".to_string()
+    } else {
+        info.candidates
+            .iter()
+            .map(|candidate| {
+                let kind = match candidate.kind {
+                    CandidateKind::Local => "local",
+                    CandidateKind::ServerReflexive => "server-reflexive",
+                };
+                format!("{} ({kind})", candidate.addr)
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    format!("{label} [{}]：{candidates}", role_label(&info.role))
+}
+
+fn role_label(role: &p2p_core::signaling::SignalingRole) -> &'static str {
+    match role {
+        p2p_core::signaling::SignalingRole::Host => "host",
+        p2p_core::signaling::SignalingRole::Guest => "guest",
     }
 }
 

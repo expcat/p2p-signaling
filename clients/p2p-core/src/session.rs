@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use tokio::sync::mpsc;
 
+use crate::nat::{collect_connect_info, ConnectInfo};
 use crate::signaling::{SignalingClient, SignalingCommand, SignalingEnvelope, SignalingRole};
 use crate::transfer::{
     decode_chunk, hash_file, metadata_for_path, open_chunk_sink, open_chunk_source,
@@ -18,7 +19,9 @@ const PERSIST_EVERY_CHUNKS: u64 = 32;
 pub enum SessionRole {
     /// 房主不携带房间码：码由服务器在 room-ready 中分配
     Host,
-    Guest { room_code: String },
+    Guest {
+        room_code: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -36,6 +39,8 @@ pub enum SessionEvent {
     Connected,
     /// 服务器在 room-ready 中下发的权威房间码
     RoomCodeAssigned(String),
+    LocalCandidatesCollected(ConnectInfo),
+    PeerCandidatesReceived(ConnectInfo),
     PeerConnected,
     PeerDisconnected,
     MessageReceived(String),
@@ -145,8 +150,11 @@ impl ChatSession {
 
         let dispatch_events = event_tx.clone();
         let dispatch_transfer_tx = transfer_tx.clone();
+        let dispatch_commands = command_tx.clone();
+        let signaling_role = signaling_role_for_session(&self.role);
         tokio::spawn(async move {
             let mut peer_seen = false;
+            let mut connect_info_sent = false;
             while let Some(raw) = incoming_rx.recv().await {
                 match serde_json::from_str::<SignalingEnvelope>(&raw) {
                     Ok(SignalingEnvelope::Chat { text }) => {
@@ -167,6 +175,12 @@ impl ChatSession {
                                 .send(TransferCommand::PeerAvailable)
                                 .await;
                         }
+                        announce_connect_info_once(
+                            &mut connect_info_sent,
+                            signaling_role.clone(),
+                            dispatch_commands.clone(),
+                            dispatch_events.clone(),
+                        );
                     }
                     Ok(SignalingEnvelope::PeerLeft { .. }) => {
                         peer_seen = false;
@@ -182,6 +196,14 @@ impl ChatSession {
                                 .await;
                         }
                         let _ = dispatch_events.send(SessionEvent::Connected).await;
+                        if signaling_role == SignalingRole::Guest {
+                            announce_connect_info_once(
+                                &mut connect_info_sent,
+                                signaling_role.clone(),
+                                dispatch_commands.clone(),
+                                dispatch_events.clone(),
+                            );
+                        }
                     }
                     Ok(envelope @ SignalingEnvelope::FileOffer { .. })
                     | Ok(envelope @ SignalingEnvelope::FileAccept { .. })
@@ -199,7 +221,21 @@ impl ChatSession {
                         }
                         let _ = peer_file_tx.send(envelope).await;
                     }
-                    Ok(SignalingEnvelope::Signal { .. }) => {}
+                    Ok(SignalingEnvelope::Signal { payload }) => {
+                        if let Ok(info) = serde_json::from_value::<ConnectInfo>(payload) {
+                            if info.is_supported() {
+                                if should_announce_peer(&mut peer_seen) {
+                                    let _ = dispatch_events.send(SessionEvent::PeerConnected).await;
+                                    let _ = dispatch_transfer_tx
+                                        .send(TransferCommand::PeerAvailable)
+                                        .await;
+                                }
+                                let _ = dispatch_events
+                                    .send(SessionEvent::PeerCandidatesReceived(info))
+                                    .await;
+                            }
+                        }
+                    }
                     Ok(SignalingEnvelope::Hello { .. }) | Ok(SignalingEnvelope::Bye) => {}
                     // 无法解析的帧是协议噪声，不能冒充对方的聊天消息
                     Err(_) => {}
@@ -227,6 +263,69 @@ impl ChatSession {
             transfer_tx,
         })
     }
+}
+
+fn signaling_role_for_session(role: &SessionRole) -> SignalingRole {
+    match role {
+        SessionRole::Host => SignalingRole::Host,
+        SessionRole::Guest { .. } => SignalingRole::Guest,
+    }
+}
+
+fn announce_connect_info_once(
+    sent: &mut bool,
+    role: SignalingRole,
+    command_tx: mpsc::Sender<SignalingCommand>,
+    event_tx: mpsc::Sender<SessionEvent>,
+) {
+    if *sent {
+        return;
+    }
+    *sent = true;
+
+    tokio::spawn(async move {
+        match collect_connect_info(role).await {
+            Ok(info) => {
+                let payload = match serde_json::to_value(&info) {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        let _ = event_tx
+                            .send(SessionEvent::Error(format!(
+                                "候选信息序列化失败：{error:#}"
+                            )))
+                            .await;
+                        return;
+                    }
+                };
+                let envelope = SignalingEnvelope::Signal { payload };
+                match serde_json::to_string(&envelope) {
+                    Ok(text) => {
+                        let _ = event_tx
+                            .send(SessionEvent::LocalCandidatesCollected(info))
+                            .await;
+                        if let Err(error) = command_tx.send(SignalingCommand::SendText(text)).await
+                        {
+                            let _ = event_tx
+                                .send(SessionEvent::Error(format!("发送候选信息失败：{error}")))
+                                .await;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = event_tx
+                            .send(SessionEvent::Error(format!(
+                                "候选信令序列化失败：{error:#}"
+                            )))
+                            .await;
+                    }
+                }
+            }
+            Err(error) => {
+                let _ = event_tx
+                    .send(SessionEvent::Error(format!("候选收集失败：{error:#}")))
+                    .await;
+            }
+        }
+    });
 }
 
 impl ChatSessionHandle {

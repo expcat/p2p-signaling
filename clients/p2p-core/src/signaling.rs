@@ -18,7 +18,7 @@ pub enum SignalingCommand {
     Close,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum SignalingRole {
     Host,
