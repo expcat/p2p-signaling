@@ -982,6 +982,7 @@ impl eframe::App for P2pChatApp {
                         .auto_shrink([false, false])
                         .max_height(chat_height)
                         .show(ui, |ui| {
+                            ui.set_max_width(finite_width(ui.available_width(), 120.0));
                             ui.add_space(10.0);
                             if self.messages.is_empty() {
                                 empty_chat(ui);
@@ -1003,23 +1004,24 @@ impl eframe::App for P2pChatApp {
                 } else {
                     "直连建立后可发送消息"
                 };
-                let composer_button_width = 86.0 + 76.0 + ui.spacing().item_spacing.x * 2.0;
-                let message_input_width = (ui.available_width() - composer_button_width).max(120.0);
-                let response = ui.add_enabled(
-                    can_send,
-                    TextEdit::singleline(&mut self.message_input)
-                        .hint_text(message_hint)
-                        .desired_width(message_input_width),
-                );
+                let button_size = Vec2::new(72.0, 32.0);
+                let composer_button_width = button_size.x * 2.0 + ui.spacing().item_spacing.x * 2.0;
+                let message_input_width =
+                    finite_width(ui.available_width() - composer_button_width, 100.0);
+                let response = ui
+                    .add_enabled_ui(can_send, |ui| {
+                        ui.add_sized(
+                            Vec2::new(message_input_width, 32.0),
+                            TextEdit::singleline(&mut self.message_input).hint_text(message_hint),
+                        )
+                    })
+                    .inner;
                 let send_pressed = can_send
                     && response.lost_focus()
                     && ui.input(|input| input.key_pressed(egui::Key::Enter));
 
                 if ui
-                    .add_enabled(
-                        can_send,
-                        egui::Button::new("发送").min_size(Vec2::new(86.0, 32.0)),
-                    )
+                    .add_enabled(can_send, egui::Button::new("发送").min_size(button_size))
                     .clicked()
                     || send_pressed
                 {
@@ -1027,10 +1029,7 @@ impl eframe::App for P2pChatApp {
                 }
 
                 if ui
-                    .add_enabled(
-                        can_send,
-                        egui::Button::new("文件").min_size(Vec2::new(76.0, 32.0)),
-                    )
+                    .add_enabled(can_send, egui::Button::new("文件").min_size(button_size))
                     .clicked()
                 {
                     self.choose_and_send_file();
@@ -1147,26 +1146,40 @@ fn chat_line(ui: &mut Ui, line: &ChatLine) {
             });
         }
         ChatAuthor::System => {
-            ui.horizontal_centered(|ui| {
-                ui.label(RichText::new(&line.text).color(Color32::from_rgb(146, 157, 171)));
+            let width = finite_width(ui.available_width(), 120.0);
+            ui.scope(|ui| {
+                ui.set_width(width);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(&line.text).color(Color32::from_rgb(146, 157, 171)),
+                    )
+                    .wrap()
+                    .halign(Align::Center),
+                );
             });
         }
     }
 }
 
 fn bubble(ui: &mut Ui, name: &str, text: &str, color: Color32) {
+    let width = finite_width(ui.available_width().min(420.0), 120.0);
+
     Frame::new()
         .fill(color)
         .corner_radius(CornerRadius::same(8))
         .inner_margin(egui::Margin::symmetric(12, 9))
         .show(ui, |ui| {
-            ui.set_max_width(420.0);
+            ui.set_max_width(width);
             ui.label(
                 RichText::new(name)
                     .small()
                     .color(Color32::from_rgb(202, 211, 222)),
             );
-            ui.label(RichText::new(text).color(Color32::WHITE));
+            ui.add(
+                egui::Label::new(RichText::new(text).color(Color32::WHITE))
+                    .wrap()
+                    .selectable(false),
+            );
         });
 }
 
@@ -1208,15 +1221,18 @@ fn transfer_row(ui: &mut Ui, transfer: &TransferLine) -> Option<TransferAction> 
 
         ui.vertical(|ui| {
             ui.set_width(text_width);
-            ui.label(RichText::new(&transfer.file_name).strong());
-            ui.label(
-                RichText::new(format!(
-                    "{direction} · {status} · {} / {}",
-                    format_bytes(transfer.completed_bytes),
-                    format_bytes(transfer.total_bytes)
-                ))
-                .small()
-                .color(Color32::from_rgb(158, 169, 185)),
+            ui.add(egui::Label::new(RichText::new(&transfer.file_name).strong()).wrap());
+            ui.add(
+                egui::Label::new(
+                    RichText::new(format!(
+                        "{direction} · {status} · {} / {}",
+                        format_bytes(transfer.completed_bytes),
+                        format_bytes(transfer.total_bytes)
+                    ))
+                    .small()
+                    .color(Color32::from_rgb(158, 169, 185)),
+                )
+                .wrap(),
             );
             ui.add(
                 egui::ProgressBar::new(fraction)
@@ -1263,15 +1279,18 @@ fn pending_offer_row(ui: &mut Ui, metadata: &FileMetadata) -> Option<TransferAct
     ui.horizontal(|ui| {
         ui.vertical(|ui| {
             ui.set_width(text_width);
-            ui.label(RichText::new(&metadata.file_name).strong());
-            ui.label(
-                RichText::new(format!(
-                    "待接收 · {} · {} 个分段",
-                    format_bytes(metadata.file_size),
-                    metadata.total_chunks
-                ))
-                .small()
-                .color(Color32::from_rgb(158, 169, 185)),
+            ui.add(egui::Label::new(RichText::new(&metadata.file_name).strong()).wrap());
+            ui.add(
+                egui::Label::new(
+                    RichText::new(format!(
+                        "待接收 · {} · {} 个分段",
+                        format_bytes(metadata.file_size),
+                        metadata.total_chunks
+                    ))
+                    .small()
+                    .color(Color32::from_rgb(158, 169, 185)),
+                )
+                .wrap(),
             );
         });
 
