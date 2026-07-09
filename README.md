@@ -196,14 +196,22 @@ npm run dev        # wrangler dev，默认 http://127.0.0.1:8787
 
 ### 客户端构建与启动脚本
 
+启动脚本默认使用 `debug` 构建，适合本地快速测试；需要用优化后的发布产物验证时再显式传 `--release` / `-Mode release`。
+构建脚本默认使用 `release`，适合发布前慢速构建；本地只检查能否编译时可传 `--debug` / `-Mode debug`。
+
 macOS：
 
 ```sh
+# 发布构建（默认 release，可能较慢）：
 ./scripts/build-client-macos.sh
+# 快速测试构建：
+./scripts/build-client-macos.sh --debug
 # 房主（房间码由服务器分配，无需 --room）：
 ./scripts/start-client-macos.sh --server p2p-signaling.yizhe.studio --role host
 # 访客（输入房主展示的 4 位码）：
 ./scripts/start-client-macos.sh --server p2p-signaling.yizhe.studio --room 1234 --role guest
+# 如需用 release 产物启动：
+./scripts/start-client-macos.sh --release --server p2p-signaling.yizhe.studio --role host
 ```
 
 `scripts/start-client-macos.command` 支持从 Finder 双击启动。
@@ -211,17 +219,27 @@ macOS：
 Windows PowerShell：
 
 ```powershell
+# 发布构建（默认 release，可能较慢）：
 .\scripts\build-client-windows.ps1
+# 快速测试构建：
+.\scripts\build-client-windows.ps1 -Mode debug
 .\scripts\start-client-windows.ps1 -Server p2p-signaling.yizhe.studio -Role host
 .\scripts\start-client-windows.ps1 -Server p2p-signaling.yizhe.studio -Room 1234 -Role guest
+# 如需用 release 产物启动：
+.\scripts\start-client-windows.ps1 -Mode release -Server p2p-signaling.yizhe.studio -Role host
 ```
 
 Windows cmd：
 
 ```bat
+REM 发布构建（默认 release，可能较慢）：
 scripts\build-client-windows.cmd
+REM 快速测试构建：
+scripts\build-client-windows.cmd -Mode debug
 scripts\start-client-windows.cmd -Server p2p-signaling.yizhe.studio -Role host
 scripts\start-client-windows.cmd -Server p2p-signaling.yizhe.studio -Room 1234 -Role guest
+REM 如需用 release 产物启动：
+scripts\start-client-windows.cmd -Mode release -Server p2p-signaling.yizhe.studio -Role host
 ```
 
 ### 环境变量

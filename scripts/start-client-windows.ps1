@@ -4,7 +4,7 @@ param(
     [ValidateSet("host", "guest")]
     [string]$Role = $(if ($env:P2P_SIGNALING_ROLE) { $env:P2P_SIGNALING_ROLE } else { "host" }),
     [ValidateSet("release", "debug")]
-    [string]$Mode = "release"
+    [string]$Mode = "debug"
 )
 
 $ErrorActionPreference = "Stop"

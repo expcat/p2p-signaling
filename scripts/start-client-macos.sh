@@ -8,7 +8,7 @@ CLIENT_DIR="${ROOT_DIR}/clients"
 SERVER="${P2P_SIGNALING_SERVER:-p2p-signaling.yizhe.studio}"
 ROOM="${P2P_SIGNALING_ROOM:-}"
 ROLE="${P2P_SIGNALING_ROLE:-host}"
-MODE="release"
+MODE="debug"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in

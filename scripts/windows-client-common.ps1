@@ -36,7 +36,13 @@ function Invoke-CargoBuild {
     for ($Attempt = 0; $Attempt -lt 2; $Attempt++) {
         $LogPath = Join-Path ([System.IO.Path]::GetTempPath()) ("p2p-signaling-cargo-{0}.log" -f ([System.Guid]::NewGuid()))
         try {
-            & cargo @CargoArguments 2>&1 | Tee-Object -FilePath $LogPath
+            $PreviousErrorActionPreference = $ErrorActionPreference
+            $ErrorActionPreference = "Continue"
+            try {
+                & cargo @CargoArguments 2>&1 | ForEach-Object { $_.ToString() } | Tee-Object -FilePath $LogPath
+            } finally {
+                $ErrorActionPreference = $PreviousErrorActionPreference
+            }
             $ExitCode = $LASTEXITCODE
 
             if ($ExitCode -eq 0) {
