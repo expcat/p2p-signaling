@@ -4,5 +4,4 @@ pub mod transfer;
 
 pub use session::{
     ChatSession, ChatSessionHandle, FileTransferProgress, SessionEvent, SessionRole,
-    TransferTransport,
 };

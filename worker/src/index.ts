@@ -65,6 +65,8 @@ export default {
   }
 };
 
+const MAX_PEERS_PER_ROOM = 2;
+
 export class RoomObject {
   private sessions = new Map<WebSocket, ClientRole>();
 
@@ -76,6 +78,10 @@ export class RoomObject {
   async fetch(request: Request): Promise<Response> {
     if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
       return json({ error: "expected websocket upgrade" }, { status: 426 });
+    }
+
+    if (this.sessions.size >= MAX_PEERS_PER_ROOM) {
+      return json({ error: "room full" }, { status: 409 });
     }
 
     const pair = new WebSocketPair();

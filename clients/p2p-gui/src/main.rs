@@ -17,7 +17,6 @@ use tokio::sync::oneshot;
 use p2p_core::transfer::{FileMetadata, TransferDirection, TransferStatus};
 use p2p_core::{
     ChatSession, ChatSessionHandle, FileTransferProgress, SessionEvent, SessionRole,
-    TransferTransport,
 };
 
 const DEFAULT_SERVER: &str = "p2p-signaling.yizhe.studio";
@@ -146,7 +145,6 @@ struct TransferLine {
     status: TransferStatus,
     completed_bytes: u64,
     total_bytes: u64,
-    transport: TransferTransport,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -161,6 +159,20 @@ enum UiNotice {
     Error(String),
 }
 
+/// 从后台任务向 UI 报错并立刻请求重绘，保证用户不动鼠标也能看到提示。
+#[derive(Clone)]
+struct UiNotifier {
+    tx: std_mpsc::Sender<UiNotice>,
+    ctx: Context,
+}
+
+impl UiNotifier {
+    fn error(&self, message: String) {
+        let _ = self.tx.send(UiNotice::Error(message));
+        self.ctx.request_repaint();
+    }
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct StoredConfig {
     server: String,
@@ -168,6 +180,7 @@ struct StoredConfig {
 
 struct P2pChatApp {
     runtime: AsyncRuntime,
+    egui_ctx: Context,
     server: String,
     room_input: String,
     active_room: Option<String>,
@@ -177,9 +190,9 @@ struct P2pChatApp {
     status: String,
     state: ConnectionState,
     handle: Option<ChatSessionHandle>,
-    event_rx: Option<tokio_mpsc::Receiver<SessionEvent>>,
+    event_rx: Option<std_mpsc::Receiver<SessionEvent>>,
     pending_test_message: Option<String>,
-    notice_tx: std_mpsc::Sender<UiNotice>,
+    notifier: UiNotifier,
     notice_rx: std_mpsc::Receiver<UiNotice>,
     config_path: Option<PathBuf>,
 }
@@ -206,6 +219,7 @@ impl P2pChatApp {
 
         let mut app = Self {
             runtime,
+            egui_ctx: cc.egui_ctx.clone(),
             server,
             room_input: initial_config.room,
             active_room: None,
@@ -217,7 +231,10 @@ impl P2pChatApp {
             handle: None,
             event_rx: None,
             pending_test_message,
-            notice_tx,
+            notifier: UiNotifier {
+                tx: notice_tx,
+                ctx: cc.egui_ctx.clone(),
+            },
             notice_rx,
             config_path,
         };
@@ -282,13 +299,26 @@ impl P2pChatApp {
         self.close_current_session();
         self.save_server();
 
-        let (event_tx, event_rx) = tokio_mpsc::channel::<SessionEvent>(64);
+        let (event_tx, mut event_rx) = tokio_mpsc::channel::<SessionEvent>(64);
         let session = ChatSession::new(role, signaling_url);
         match self.runtime.wait(session.start(event_tx)) {
             Ok(Ok(handle)) => {
+                // 后台事件经转发任务进入 std channel，同时请求重绘——
+                // egui 按需渲染，没有这一步空闲时收到的消息/进度不会显示
+                let (ui_event_tx, ui_event_rx) = std_mpsc::channel();
+                let ctx = self.egui_ctx.clone();
+                self.runtime.spawn(async move {
+                    while let Some(event) = event_rx.recv().await {
+                        if ui_event_tx.send(event).is_err() {
+                            break;
+                        }
+                        ctx.request_repaint();
+                    }
+                });
+
                 let test_handle = handle.clone();
                 self.handle = Some(handle);
-                self.event_rx = Some(event_rx);
+                self.event_rx = Some(ui_event_rx);
                 self.active_room = Some(room.clone());
                 self.messages.clear();
                 self.state = ConnectionState::Connecting;
@@ -296,12 +326,11 @@ impl P2pChatApp {
                 self.push_system(format!("房间 {room} {action}，正在连接信令服务。"));
                 if let Some(message) = self.pending_test_message.take() {
                     self.push_system(format!("将在连接后自动发送测试消息：{message}"));
-                    let notice_tx = self.notice_tx.clone();
+                    let notifier = self.notifier.clone();
                     self.runtime.spawn(async move {
                         tokio::time::sleep(Duration::from_millis(1500)).await;
                         if let Err(error) = test_handle.send_text(message).await {
-                            let _ = notice_tx
-                                .send(UiNotice::Error(format!("发送测试消息失败：{error:#}")));
+                            notifier.error(format!("发送测试消息失败：{error:#}"));
                         }
                     });
                 }
@@ -341,10 +370,10 @@ impl P2pChatApp {
 
         self.push_message(ChatAuthor::Mine, text.clone());
 
-        let notice_tx = self.notice_tx.clone();
+        let notifier = self.notifier.clone();
         self.runtime.spawn(async move {
             if let Err(error) = handle.send_text(text).await {
-                let _ = notice_tx.send(UiNotice::Error(format!("发送失败：{error:#}")));
+                notifier.error(format!("发送失败：{error:#}"));
             }
         });
     }
@@ -365,10 +394,10 @@ impl P2pChatApp {
             .to_string();
         self.push_system(format!("准备发送文件：{label}"));
 
-        let notice_tx = self.notice_tx.clone();
+        let notifier = self.notifier.clone();
         self.runtime.spawn(async move {
             if let Err(error) = handle.send_file(path).await {
-                let _ = notice_tx.send(UiNotice::Error(format!("发送文件失败：{error:#}")));
+                notifier.error(format!("发送文件失败：{error:#}"));
             }
         });
     }
@@ -386,20 +415,20 @@ impl P2pChatApp {
         match save_path {
             Some(path) => {
                 self.push_system(format!("开始接收文件：{}", metadata.file_name));
-                let notice_tx = self.notice_tx.clone();
+                let notifier = self.notifier.clone();
                 self.runtime.spawn(async move {
                     if let Err(error) = handle.accept_file(transfer_id, path).await {
-                        let _ = notice_tx.send(UiNotice::Error(format!("接收文件失败：{error:#}")));
+                        notifier.error(format!("接收文件失败：{error:#}"));
                     }
                 });
             }
             None => {
                 self.push_system(format!("已拒绝文件：{}", metadata.file_name));
-                let notice_tx = self.notice_tx.clone();
+                let notifier = self.notifier.clone();
                 self.runtime.spawn(async move {
                     if let Err(error) = handle.reject_file(transfer_id, "用户取消保存".into()).await
                     {
-                        let _ = notice_tx.send(UiNotice::Error(format!("拒绝文件失败：{error:#}")));
+                        notifier.error(format!("拒绝文件失败：{error:#}"));
                     }
                 });
             }
@@ -417,7 +446,6 @@ impl P2pChatApp {
             line.status = progress.status;
             line.completed_bytes = progress.completed_bytes;
             line.total_bytes = progress.total_bytes;
-            line.transport = progress.transport;
             return;
         }
 
@@ -428,7 +456,6 @@ impl P2pChatApp {
             status: progress.status,
             completed_bytes: progress.completed_bytes,
             total_bytes: progress.total_bytes,
-            transport: progress.transport,
         });
     }
 
@@ -436,10 +463,10 @@ impl P2pChatApp {
         let Some(handle) = self.handle.clone() else {
             return;
         };
-        let notice_tx = self.notice_tx.clone();
+        let notifier = self.notifier.clone();
         self.runtime.spawn(async move {
             if let Err(error) = handle.pause_transfer(transfer_id).await {
-                let _ = notice_tx.send(UiNotice::Error(format!("暂停失败：{error:#}")));
+                notifier.error(format!("暂停失败：{error:#}"));
             }
         });
     }
@@ -448,10 +475,10 @@ impl P2pChatApp {
         let Some(handle) = self.handle.clone() else {
             return;
         };
-        let notice_tx = self.notice_tx.clone();
+        let notifier = self.notifier.clone();
         self.runtime.spawn(async move {
             if let Err(error) = handle.resume_transfer(transfer_id).await {
-                let _ = notice_tx.send(UiNotice::Error(format!("继续失败：{error:#}")));
+                notifier.error(format!("继续失败：{error:#}"));
             }
         });
     }
@@ -460,10 +487,10 @@ impl P2pChatApp {
         let Some(handle) = self.handle.clone() else {
             return;
         };
-        let notice_tx = self.notice_tx.clone();
+        let notifier = self.notifier.clone();
         self.runtime.spawn(async move {
             if let Err(error) = handle.cancel_transfer(transfer_id, "用户取消".into()).await {
-                let _ = notice_tx.send(UiNotice::Error(format!("取消失败：{error:#}")));
+                notifier.error(format!("取消失败：{error:#}"));
             }
         });
     }
@@ -486,7 +513,7 @@ impl P2pChatApp {
         self.push_system("连接已断开。");
     }
 
-    fn poll_background_events(&mut self, ctx: &Context) {
+    fn poll_background_events(&mut self) {
         while let Ok(notice) = self.notice_rx.try_recv() {
             match notice {
                 UiNotice::Error(message) => {
@@ -494,7 +521,6 @@ impl P2pChatApp {
                     self.push_system(message);
                 }
             }
-            ctx.request_repaint();
         }
 
         let mut events = Vec::new();
@@ -530,7 +556,6 @@ impl P2pChatApp {
                 SessionEvent::MessageReceived(text) => {
                     self.mark_peer_available(None);
                     self.push_message(ChatAuthor::Peer, text);
-                    ctx.request_repaint();
                 }
                 SessionEvent::FileOffered(metadata) => {
                     self.mark_peer_available(None);
@@ -540,11 +565,9 @@ impl P2pChatApp {
                         format_bytes(metadata.file_size)
                     ));
                     self.accept_file_offer(metadata);
-                    ctx.request_repaint();
                 }
                 SessionEvent::FileProgress(progress) => {
                     self.update_transfer(progress);
-                    ctx.request_repaint();
                 }
                 SessionEvent::FileCompleted {
                     transfer_id: _,
@@ -556,7 +579,6 @@ impl P2pChatApp {
                         .map(|path| format!("：{}", path.display()))
                         .unwrap_or_default();
                     self.push_system(format!("文件已完成：{file_name}{suffix}"));
-                    ctx.request_repaint();
                 }
                 SessionEvent::FileFailed {
                     transfer_id: _,
@@ -564,7 +586,6 @@ impl P2pChatApp {
                     message,
                 } => {
                     self.push_system(format!("文件失败：{file_name}，{message}"));
-                    ctx.request_repaint();
                 }
                 SessionEvent::FileCancelled {
                     transfer_id: _,
@@ -572,7 +593,6 @@ impl P2pChatApp {
                     reason,
                 } => {
                     self.push_system(format!("文件已取消：{file_name}，{reason}"));
-                    ctx.request_repaint();
                 }
                 SessionEvent::Error(message) => {
                     self.state = ConnectionState::Idle;
@@ -716,8 +736,7 @@ impl Drop for AsyncRuntime {
 
 impl eframe::App for P2pChatApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
-        let ctx = ui.ctx().clone();
-        self.poll_background_events(&ctx);
+        self.poll_background_events();
 
         egui::Panel::top("top_bar").show(ui, |ui| {
             ui.add_space(10.0);
@@ -1045,17 +1064,13 @@ fn transfer_row(ui: &mut Ui, transfer: &TransferLine) -> Option<TransferAction> 
             TransferDirection::Receive => "接收",
         };
         let status = transfer_status_label(&transfer.status);
-        let transport = match transfer.transport {
-            TransferTransport::WebRtc => "直连准备",
-            TransferTransport::WorkerFallback => "中继续传",
-        };
 
         ui.vertical(|ui| {
             ui.set_width(ui.available_width() - 184.0);
             ui.label(RichText::new(&transfer.file_name).strong());
             ui.label(
                 RichText::new(format!(
-                    "{direction} · {status} · {transport} · {} / {}",
+                    "{direction} · {status} · {} / {}",
                     format_bytes(transfer.completed_bytes),
                     format_bytes(transfer.total_bytes)
                 ))

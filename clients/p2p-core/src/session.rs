@@ -2,26 +2,22 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use serde_json::json;
 use tokio::sync::mpsc;
 
 use crate::signaling::{SignalingClient, SignalingCommand, SignalingEnvelope, SignalingRole};
 use crate::transfer::{
-    decode_chunk, hash_file, metadata_for_path, read_chunk, write_chunk, ChunkRange, FileMetadata,
-    RangeSet, TransferDirection, TransferManifest, TransferStatus, TransferStore,
-    RTC_FALLBACK_AFTER_MS,
+    decode_chunk, hash_file, metadata_for_path, open_chunk_sink, open_chunk_source,
+    read_chunk_from, validate_offer_metadata, write_chunk_to, ChunkRange, FileMetadata, RangeSet,
+    TransferDirection, TransferManifest, TransferStatus, TransferStore,
 };
+
+/// 接收端每收到多少个分块就持久化一次 manifest 并回执一次 FileAck/进度。
+const PERSIST_EVERY_CHUNKS: u64 = 32;
 
 #[derive(Debug, Clone)]
 pub enum SessionRole {
     Host { room_code: String },
     Guest { room_code: String },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TransferTransport {
-    WebRtc,
-    WorkerFallback,
 }
 
 #[derive(Debug, Clone)]
@@ -32,7 +28,6 @@ pub struct FileTransferProgress {
     pub status: TransferStatus,
     pub completed_bytes: u64,
     pub total_bytes: u64,
-    pub transport: TransferTransport,
 }
 
 #[derive(Debug)]
@@ -183,11 +178,8 @@ impl ChatSession {
                     }
                     Ok(SignalingEnvelope::Signal { .. }) => {}
                     Ok(SignalingEnvelope::Hello { .. }) | Ok(SignalingEnvelope::Bye) => {}
-                    Err(_) => {
-                        let _ = dispatch_events
-                            .send(SessionEvent::MessageReceived(raw))
-                            .await;
-                    }
+                    // 无法解析的帧是协议噪声，不能冒充对方的聊天消息
+                    Err(_) => {}
                 }
             }
         });
@@ -298,6 +290,9 @@ struct TransferRuntime {
     store: TransferStore,
     manifests: HashMap<String, TransferManifest>,
     offers: HashMap<String, FileMetadata>,
+    active_sends: HashMap<String, tokio::task::JoinHandle<()>>,
+    open_files: HashMap<String, tokio::fs::File>,
+    chunks_since_persist: HashMap<String, u64>,
 }
 
 impl TransferRuntime {
@@ -323,7 +318,26 @@ impl TransferRuntime {
             store,
             manifests,
             offers: HashMap::new(),
+            active_sends: HashMap::new(),
+            open_files: HashMap::new(),
+            chunks_since_persist: HashMap::new(),
         })
+    }
+
+    fn abort_send(&mut self, transfer_id: &str) {
+        if let Some(handle) = self.active_sends.remove(transfer_id) {
+            handle.abort();
+        }
+    }
+
+    async fn close_receive_file(&mut self, transfer_id: &str) -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+
+        self.chunks_since_persist.remove(transfer_id);
+        if let Some(mut file) = self.open_files.remove(transfer_id) {
+            file.flush().await?;
+        }
+        Ok(())
     }
 
     async fn run(&mut self) {
@@ -349,8 +363,7 @@ impl TransferRuntime {
 
     async fn emit_loaded_pending(&self) {
         for manifest in self.manifests.values() {
-            self.emit_progress(manifest, TransferTransport::WorkerFallback)
-                .await;
+            self.emit_progress(manifest).await;
         }
     }
 
@@ -421,9 +434,7 @@ impl TransferRuntime {
         self.manifests
             .insert(metadata.transfer_id.clone(), manifest.clone());
 
-        self.emit_progress(&manifest, TransferTransport::WebRtc)
-            .await;
-        self.send_rtc_probe(&metadata.transfer_id).await?;
+        self.emit_progress(&manifest).await;
         self.send_envelope(SignalingEnvelope::FileOffer { metadata })
             .await
     }
@@ -441,8 +452,17 @@ impl TransferRuntime {
 
         let manifest = match self.store.load(&transfer_id).await? {
             Some(mut existing) if existing.direction == TransferDirection::Receive => {
+                let path_changed = existing.output_path.as_deref() != Some(save_path.as_path());
                 existing.output_path = Some(save_path.clone());
                 existing.temp_path = Some(crate::transfer::part_path(&save_path));
+                // 换了保存位置或临时文件已丢失时，旧进度对应的数据不存在，必须重新请求
+                let temp_missing = match existing.temp_path.as_deref() {
+                    Some(temp) => tokio::fs::metadata(temp).await.is_err(),
+                    None => true,
+                };
+                if path_changed || temp_missing {
+                    existing.completed_chunks.clear();
+                }
                 existing.status = TransferStatus::Accepted;
                 existing
             }
@@ -452,8 +472,13 @@ impl TransferRuntime {
         let missing = manifest.missing_ranges();
         self.store.save(&manifest).await?;
         self.manifests.insert(transfer_id.clone(), manifest.clone());
-        self.emit_progress(&manifest, TransferTransport::WorkerFallback)
-            .await;
+        self.emit_progress(&manifest).await;
+
+        if missing.is_empty() {
+            // 0 字节文件（或已全部接收）不会再有分块到达，直接走收尾流程
+            self.ensure_temp_file(&manifest).await?;
+            return self.finish_receive(&transfer_id).await;
+        }
 
         self.send_envelope(SignalingEnvelope::FileAccept {
             transfer_id,
@@ -462,20 +487,52 @@ impl TransferRuntime {
         .await
     }
 
-    async fn handle_offer(&mut self, metadata: FileMetadata) -> Result<()> {
+    async fn ensure_temp_file(&self, manifest: &TransferManifest) -> Result<()> {
+        let Some(temp) = manifest.temp_path.as_deref() else {
+            return Ok(());
+        };
+        if tokio::fs::metadata(temp).await.is_err() {
+            drop(open_chunk_sink(temp).await?);
+        }
+        Ok(())
+    }
+
+    async fn handle_offer(&mut self, mut metadata: FileMetadata) -> Result<()> {
+        if let Err(reason) = validate_offer_metadata(&mut metadata) {
+            return self
+                .send_envelope(SignalingEnvelope::FileReject {
+                    transfer_id: metadata.transfer_id,
+                    reason,
+                })
+                .await;
+        }
+
         if let Some(mut existing) = self.store.load(&metadata.transfer_id).await? {
             if existing.direction == TransferDirection::Receive && !existing.is_complete() {
                 existing.metadata = metadata;
                 existing.status = TransferStatus::Accepted;
+                // 临时文件已丢失时旧进度无效，必须从头请求
+                let temp_missing = match existing.temp_path.as_deref() {
+                    Some(temp) => tokio::fs::metadata(temp).await.is_err(),
+                    None => true,
+                };
+                if temp_missing {
+                    existing.completed_chunks.clear();
+                }
                 let missing = existing.missing_ranges();
                 self.store.save(&existing).await?;
-                self.manifests
-                    .insert(existing.metadata.transfer_id.clone(), existing.clone());
-                self.emit_progress(&existing, TransferTransport::WorkerFallback)
-                    .await;
+                let transfer_id = existing.metadata.transfer_id.clone();
+                self.manifests.insert(transfer_id.clone(), existing.clone());
+                self.emit_progress(&existing).await;
+
+                if missing.is_empty() {
+                    self.ensure_temp_file(&existing).await?;
+                    return self.finish_receive(&transfer_id).await;
+                }
+
                 return self
                     .send_envelope(SignalingEnvelope::FileResume {
-                        transfer_id: existing.metadata.transfer_id,
+                        transfer_id,
                         missing,
                     })
                     .await;
@@ -517,65 +574,52 @@ impl TransferRuntime {
         let metadata = manifest.metadata.clone();
         let signal_tx = self.signal_tx.clone();
         let event_tx = self.event_tx.clone();
-        let store = TransferStore::new(self.store.root().to_path_buf());
-        let mut task_manifest = progress_manifest.clone();
-        self.emit_progress(&progress_manifest, TransferTransport::WorkerFallback)
-            .await;
+        self.emit_progress(&progress_manifest).await;
 
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(RTC_FALLBACK_AFTER_MS)).await;
+        // 同一传输只保留一个发送循环；暂停/取消时由 abort_send 终止
+        self.abort_send(&transfer_id);
+        let handle = tokio::spawn(async move {
+            let fail = |message: String| {
+                let event_tx = event_tx.clone();
+                let transfer_id = metadata.transfer_id.clone();
+                let file_name = metadata.file_name.clone();
+                async move {
+                    let _ = event_tx
+                        .send(SessionEvent::FileFailed {
+                            transfer_id,
+                            file_name,
+                            message,
+                        })
+                        .await;
+                }
+            };
+
+            let mut file = match open_chunk_source(&source_path).await {
+                Ok(file) => file,
+                Err(error) => return fail(format!("{error:#}")).await,
+            };
+
             for range in missing {
                 for index in range.start..range.end {
-                    if task_manifest.status == TransferStatus::Paused {
-                        return;
-                    }
-
-                    match read_chunk(&source_path, index, metadata.chunk_size).await {
+                    match read_chunk_from(&mut file, index, metadata.chunk_size).await {
                         Ok(mut chunk) => {
                             chunk.transfer_id = metadata.transfer_id.clone();
                             let envelope = SignalingEnvelope::FileChunk { chunk };
                             let send_result = match serde_json::to_string(&envelope) {
                                 Ok(text) => signal_tx.send(SignalingCommand::SendText(text)).await,
-                                Err(error) => {
-                                    let _ = event_tx
-                                        .send(SessionEvent::FileFailed {
-                                            transfer_id: metadata.transfer_id.clone(),
-                                            file_name: metadata.file_name.clone(),
-                                            message: format!("{error:#}"),
-                                        })
-                                        .await;
-                                    return;
-                                }
+                                Err(error) => return fail(format!("{error:#}")).await,
                             };
 
                             if let Err(error) = send_result {
-                                let _ = event_tx
-                                    .send(SessionEvent::FileFailed {
-                                        transfer_id: metadata.transfer_id.clone(),
-                                        file_name: metadata.file_name.clone(),
-                                        message: format!("发送分段失败：{error}"),
-                                    })
-                                    .await;
-                                return;
+                                return fail(format!("发送分段失败：{error}")).await;
                             }
                         }
-                        Err(error) => {
-                            task_manifest.status = TransferStatus::Failed;
-                            task_manifest.failure = Some(format!("{error:#}"));
-                            let _ = store.save(&task_manifest).await;
-                            let _ = event_tx
-                                .send(SessionEvent::FileFailed {
-                                    transfer_id: metadata.transfer_id.clone(),
-                                    file_name: metadata.file_name.clone(),
-                                    message: format!("{error:#}"),
-                                })
-                                .await;
-                            return;
-                        }
+                        Err(error) => return fail(format!("{error:#}")).await,
                     }
                 }
             }
         });
+        self.active_sends.insert(transfer_id, handle);
 
         Ok(())
     }
@@ -583,8 +627,9 @@ impl TransferRuntime {
     async fn receive_chunk(&mut self, chunk: crate::transfer::FileChunk) -> Result<()> {
         let transfer_id = chunk.transfer_id.clone();
         let decoded = decode_chunk(&chunk)?;
-        let (completed, complete) = {
-            let Some(manifest) = self.manifests.get_mut(&transfer_id) else {
+
+        let (temp_path, chunk_size) = {
+            let Some(manifest) = self.manifests.get(&transfer_id) else {
                 return Ok(());
             };
             if manifest.direction != TransferDirection::Receive
@@ -592,29 +637,63 @@ impl TransferRuntime {
             {
                 return Ok(());
             }
+            if decoded.index >= manifest.metadata.total_chunks
+                || decoded.bytes.len() as u64 > manifest.metadata.chunk_size
+            {
+                anyhow::bail!("chunk {} 越界", decoded.index);
+            }
 
-            let temp_path = manifest
-                .temp_path
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("缺少临时接收路径"))?;
-            write_chunk(&temp_path, &decoded, manifest.metadata.chunk_size).await?;
+            (
+                manifest
+                    .temp_path
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("缺少临时接收路径"))?,
+                manifest.metadata.chunk_size,
+            )
+        };
 
+        if !self.open_files.contains_key(&transfer_id) {
+            let file = open_chunk_sink(&temp_path).await?;
+            self.open_files.insert(transfer_id.clone(), file);
+        }
+        let file = self
+            .open_files
+            .get_mut(&transfer_id)
+            .expect("接收句柄刚刚插入");
+        write_chunk_to(file, &decoded, chunk_size).await?;
+
+        let (completed, complete, should_report) = {
+            let Some(manifest) = self.manifests.get_mut(&transfer_id) else {
+                return Ok(());
+            };
             let mut completed = manifest.completed_set();
             completed.insert(decoded.index);
             manifest.completed_chunks = completed.clone().into_ranges();
             let complete = completed.completed_chunks() >= manifest.metadata.total_chunks;
-            self.store.save(manifest).await?;
-            let progress_manifest = manifest.clone();
-            self.emit_progress(&progress_manifest, TransferTransport::WorkerFallback)
-                .await;
-            (completed, complete)
+
+            // manifest 落盘、FileAck 与进度事件按分块数节流，避免每 32KB 一次全量开销
+            let counter = self
+                .chunks_since_persist
+                .entry(transfer_id.clone())
+                .or_insert(0);
+            *counter += 1;
+            let should_report = complete || *counter >= PERSIST_EVERY_CHUNKS;
+            if should_report {
+                *counter = 0;
+                self.store.save(manifest).await?;
+                let progress_manifest = manifest.clone();
+                self.emit_progress(&progress_manifest).await;
+            }
+            (completed, complete, should_report)
         };
 
-        self.send_envelope(SignalingEnvelope::FileAck {
-            transfer_id: transfer_id.clone(),
-            received: completed.ranges().to_vec(),
-        })
-        .await?;
+        if should_report {
+            self.send_envelope(SignalingEnvelope::FileAck {
+                transfer_id: transfer_id.clone(),
+                received: completed.ranges().to_vec(),
+            })
+            .await?;
+        }
 
         if complete {
             self.finish_receive(&transfer_id).await?;
@@ -635,6 +714,8 @@ impl TransferRuntime {
             .output_path
             .clone()
             .ok_or_else(|| anyhow::anyhow!("缺少保存路径"))?;
+        // 校验和改名前必须刷新并关闭写入句柄（Windows 下句柄未关闭无法 rename）
+        self.close_receive_file(transfer_id).await?;
         let actual_hash = hash_file(&temp_path).await?;
 
         if actual_hash != snapshot.metadata.file_hash {
@@ -690,8 +771,7 @@ impl TransferRuntime {
         }
 
         if let Some((transfer_id, file_name, output_path, progress_manifest)) = completed_event {
-            self.emit_progress(&progress_manifest, TransferTransport::WorkerFallback)
-                .await;
+            self.emit_progress(&progress_manifest).await;
             self.event_tx
                 .send(SessionEvent::FileCompleted {
                     transfer_id,
@@ -722,13 +802,14 @@ impl TransferRuntime {
         }
 
         if let Some(manifest) = progress_manifest {
-            self.emit_progress(&manifest, TransferTransport::WorkerFallback)
-                .await;
+            self.emit_progress(&manifest).await;
         }
         Ok(())
     }
 
     async fn mark_complete(&mut self, transfer_id: &str) -> Result<()> {
+        self.abort_send(transfer_id);
+        self.close_receive_file(transfer_id).await?;
         let mut completed_event = None;
         if let Some(manifest) = self.manifests.get_mut(transfer_id) {
             manifest.status = TransferStatus::Complete;
@@ -743,8 +824,7 @@ impl TransferRuntime {
         }
 
         if let Some((manifest, transfer_id, file_name, path)) = completed_event {
-            self.emit_progress(&manifest, TransferTransport::WorkerFallback)
-                .await;
+            self.emit_progress(&manifest).await;
             self.event_tx
                 .send(SessionEvent::FileCompleted {
                     transfer_id,
@@ -758,6 +838,8 @@ impl TransferRuntime {
     }
 
     async fn mark_failed(&mut self, transfer_id: &str, reason: String) -> Result<()> {
+        self.abort_send(transfer_id);
+        self.close_receive_file(transfer_id).await?;
         let mut failed_event = None;
         if let Some(manifest) = self.manifests.get_mut(transfer_id) {
             manifest.status = TransferStatus::Failed;
@@ -782,6 +864,8 @@ impl TransferRuntime {
     }
 
     async fn mark_cancelled(&mut self, transfer_id: &str, reason: String) -> Result<()> {
+        self.abort_send(transfer_id);
+        self.close_receive_file(transfer_id).await?;
         let mut cancelled_event = None;
         if let Some(manifest) = self.manifests.get_mut(transfer_id) {
             manifest.status = TransferStatus::Cancelled;
@@ -806,6 +890,8 @@ impl TransferRuntime {
     }
 
     async fn pause_transfer(&mut self, transfer_id: &str) -> Result<()> {
+        self.abort_send(transfer_id);
+        self.close_receive_file(transfer_id).await?;
         let mut progress_manifest = None;
         if let Some(manifest) = self.manifests.get_mut(transfer_id) {
             manifest.status = TransferStatus::Paused;
@@ -814,8 +900,7 @@ impl TransferRuntime {
         }
 
         if let Some(manifest) = progress_manifest {
-            self.emit_progress(&manifest, TransferTransport::WorkerFallback)
-                .await;
+            self.emit_progress(&manifest).await;
         }
         Ok(())
     }
@@ -842,8 +927,7 @@ impl TransferRuntime {
             return Ok(());
         };
 
-        self.emit_progress(&progress_manifest, TransferTransport::WorkerFallback)
-            .await;
+        self.emit_progress(&progress_manifest).await;
         self.send_envelope(envelope).await
     }
 
@@ -859,13 +943,18 @@ impl TransferRuntime {
     async fn announce_pending(&mut self) -> Result<()> {
         let manifests = self.manifests.values().cloned().collect::<Vec<_>>();
         for manifest in manifests {
-            if manifest.is_complete() {
+            // 已完成、已取消或用户主动暂停的传输不随对方重新上线自动恢复
+            if manifest.is_complete()
+                || matches!(
+                    manifest.status,
+                    TransferStatus::Cancelled | TransferStatus::Paused
+                )
+            {
                 continue;
             }
 
             match manifest.direction {
                 TransferDirection::Send => {
-                    self.send_rtc_probe(&manifest.metadata.transfer_id).await?;
                     self.send_envelope(SignalingEnvelope::FileOffer {
                         metadata: manifest.metadata,
                     })
@@ -885,18 +974,6 @@ impl TransferRuntime {
         Ok(())
     }
 
-    async fn send_rtc_probe(&self, transfer_id: &str) -> Result<()> {
-        let payload = json!({
-            "kind": "rtc-transfer-probe",
-            "transferId": transfer_id,
-            "stun": ["stun:stun.l.google.com:19302"],
-            "fallbackAfterMs": RTC_FALLBACK_AFTER_MS
-        });
-
-        self.send_envelope(SignalingEnvelope::Signal { payload })
-            .await
-    }
-
     async fn send_envelope(&self, envelope: SignalingEnvelope) -> Result<()> {
         self.signal_tx
             .send(SignalingCommand::SendText(serde_json::to_string(
@@ -906,7 +983,7 @@ impl TransferRuntime {
         Ok(())
     }
 
-    async fn emit_progress(&self, manifest: &TransferManifest, transport: TransferTransport) {
+    async fn emit_progress(&self, manifest: &TransferManifest) {
         self.event_tx
             .send(SessionEvent::FileProgress(FileTransferProgress {
                 transfer_id: manifest.metadata.transfer_id.clone(),
@@ -915,7 +992,6 @@ impl TransferRuntime {
                 status: manifest.status.clone(),
                 completed_bytes: manifest.completed_bytes(),
                 total_bytes: manifest.metadata.file_size,
-                transport,
             }))
             .await
             .ok();

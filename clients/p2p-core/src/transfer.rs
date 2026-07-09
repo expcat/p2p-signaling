@@ -9,7 +9,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use uuid::Uuid;
 
 pub const DEFAULT_CHUNK_SIZE: u64 = 32 * 1024;
-pub const RTC_FALLBACK_AFTER_MS: u64 = 5_000;
+pub const MAX_CHUNK_SIZE: u64 = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChunkRange {
@@ -343,14 +343,33 @@ pub async fn metadata_for_path(path: &Path) -> Result<FileMetadata> {
 }
 
 pub async fn read_chunk(path: &Path, index: u64, chunk_size: u64) -> Result<FileChunk> {
-    let mut file = tokio::fs::File::open(path)
+    let mut file = open_chunk_source(path).await?;
+    read_chunk_from(&mut file, index, chunk_size).await
+}
+
+pub async fn open_chunk_source(path: &Path) -> Result<tokio::fs::File> {
+    tokio::fs::File::open(path)
         .await
-        .with_context(|| format!("无法打开文件：{}", path.display()))?;
+        .with_context(|| format!("无法打开文件：{}", path.display()))
+}
+
+pub async fn read_chunk_from(
+    file: &mut tokio::fs::File,
+    index: u64,
+    chunk_size: u64,
+) -> Result<FileChunk> {
     let offset = index.saturating_mul(chunk_size);
     file.seek(std::io::SeekFrom::Start(offset)).await?;
 
     let mut bytes = vec![0; chunk_size as usize];
-    let read = file.read(&mut bytes).await?;
+    let mut read = 0;
+    while read < bytes.len() {
+        let count = file.read(&mut bytes[read..]).await?;
+        if count == 0 {
+            break;
+        }
+        read += count;
+    }
     bytes.truncate(read);
 
     Ok(FileChunk {
@@ -363,18 +382,31 @@ pub async fn read_chunk(path: &Path, index: u64, chunk_size: u64) -> Result<File
     })
 }
 
-pub async fn write_chunk(path: &Path, chunk: &DecodedChunk, chunk_size: u64) -> Result<()> {
+pub async fn open_chunk_sink(path: &Path) -> Result<tokio::fs::File> {
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
 
     let mut options = tokio::fs::OpenOptions::new();
     options.create(true).write(true).read(true);
-    let mut file = options.open(path).await?;
+    Ok(options.open(path).await?)
+}
+
+pub async fn write_chunk(path: &Path, chunk: &DecodedChunk, chunk_size: u64) -> Result<()> {
+    let mut file = open_chunk_sink(path).await?;
+    write_chunk_to(&mut file, chunk, chunk_size).await?;
+    file.flush().await?;
+    Ok(())
+}
+
+pub async fn write_chunk_to(
+    file: &mut tokio::fs::File,
+    chunk: &DecodedChunk,
+    chunk_size: u64,
+) -> Result<()> {
     let offset = chunk.index.saturating_mul(chunk_size);
     file.seek(std::io::SeekFrom::Start(offset)).await?;
     file.write_all(&chunk.bytes).await?;
-    file.flush().await?;
     Ok(())
 }
 
@@ -396,25 +428,53 @@ pub fn decode_chunk(chunk: &FileChunk) -> Result<DecodedChunk> {
 }
 
 pub async fn hash_file(path: &Path) -> Result<String> {
-    let mut file = tokio::fs::File::open(path).await?;
-    let mut hash = Sha256::new();
-    let mut buffer = vec![0; 64 * 1024];
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
 
-    loop {
-        let read = file.read(&mut buffer).await?;
-        if read == 0 {
-            break;
+        let mut file = std::fs::File::open(&path)?;
+        let mut hash = Sha256::new();
+        let mut buffer = vec![0; 1024 * 1024];
+
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            hash.update(&buffer[..read]);
         }
-        hash.update(&buffer[..read]);
-    }
 
-    Ok(bytes_to_hex(hash.finalize().as_slice()))
+        Ok(bytes_to_hex(hash.finalize().as_slice()))
+    })
+    .await?
 }
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let mut hash = Sha256::new();
     hash.update(bytes);
     bytes_to_hex(hash.finalize().as_slice())
+}
+
+/// 校验对端 FileOffer 的元数据，防止恶意 chunk_size/total_chunks 造成超大稀疏文件
+/// 或带路径的文件名逃出保存目录。通过时会把 file_name 归一为纯文件名。
+pub fn validate_offer_metadata(metadata: &mut FileMetadata) -> std::result::Result<(), String> {
+    let Some(file_name) = Path::new(&metadata.file_name)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+    else {
+        return Err(format!("文件名不合法：{}", metadata.file_name));
+    };
+    metadata.file_name = file_name.to_owned();
+
+    if metadata.chunk_size == 0 || metadata.chunk_size > MAX_CHUNK_SIZE {
+        return Err(format!("分块大小不合法：{}", metadata.chunk_size));
+    }
+    if metadata.total_chunks != metadata.file_size.div_ceil(metadata.chunk_size) {
+        return Err("分块数量与文件大小不一致".into());
+    }
+
+    Ok(())
 }
 
 pub fn part_path(path: &Path) -> PathBuf {
@@ -440,33 +500,40 @@ fn transfer_id_for(
 }
 
 async fn sample_hash(path: &Path, file_size: u64) -> Result<String> {
-    let mut file = tokio::fs::File::open(path).await?;
-    let mut hash = Sha256::new();
-    let sample_len = 4096_u64.min(file_size);
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        use std::io::{Read, Seek};
 
-    if sample_len > 0 {
-        let mut head = vec![0; sample_len as usize];
-        file.read_exact(&mut head).await?;
-        hash.update(head);
-    }
+        let mut file = std::fs::File::open(&path)?;
+        let mut hash = Sha256::new();
+        let sample_len = 4096_u64.min(file_size);
 
-    if file_size > sample_len {
-        file.seek(std::io::SeekFrom::Start(
-            file_size.saturating_sub(sample_len),
-        ))
-        .await?;
-        let mut tail = vec![0; sample_len as usize];
-        file.read_exact(&mut tail).await?;
-        hash.update(tail);
-    }
+        if sample_len > 0 {
+            let mut head = vec![0; sample_len as usize];
+            file.read_exact(&mut head)?;
+            hash.update(head);
+        }
 
-    Ok(bytes_to_hex(hash.finalize().as_slice()))
+        if file_size > sample_len {
+            file.seek(std::io::SeekFrom::Start(
+                file_size.saturating_sub(sample_len),
+            ))?;
+            let mut tail = vec![0; sample_len as usize];
+            file.read_exact(&mut tail)?;
+            hash.update(tail);
+        }
+
+        Ok(bytes_to_hex(hash.finalize().as_slice()))
+    })
+    .await?
 }
 
 fn bytes_to_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+
     let mut text = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
-        text.push_str(&format!("{byte:02x}"));
+        let _ = write!(text, "{byte:02x}");
     }
     text
 }
@@ -543,6 +610,59 @@ mod tests {
         let second = metadata_for_path(&file).await.unwrap();
         assert_eq!(first.transfer_id, second.transfer_id);
         assert_eq!(first.total_chunks, 1);
+
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[test]
+    fn offer_metadata_validation_rejects_malicious_values() {
+        let make = |file_name: &str, file_size: u64, chunk_size: u64, total_chunks: u64| {
+            FileMetadata {
+                transfer_id: "file-test".into(),
+                file_name: file_name.into(),
+                file_size,
+                chunk_size,
+                total_chunks,
+                modified_millis: None,
+                sample_hash: "sample".into(),
+                file_hash: "hash".into(),
+            }
+        };
+
+        let mut valid = make("a.bin", DEFAULT_CHUNK_SIZE + 1, DEFAULT_CHUNK_SIZE, 2);
+        assert!(validate_offer_metadata(&mut valid).is_ok());
+
+        let mut zero_chunk_size = make("a.bin", 10, 0, 1);
+        assert!(validate_offer_metadata(&mut zero_chunk_size).is_err());
+
+        let mut oversized_chunk = make("a.bin", 10, MAX_CHUNK_SIZE + 1, 1);
+        assert!(validate_offer_metadata(&mut oversized_chunk).is_err());
+
+        let mut mismatched_chunks = make("a.bin", DEFAULT_CHUNK_SIZE, DEFAULT_CHUNK_SIZE, 999);
+        assert!(validate_offer_metadata(&mut mismatched_chunks).is_err());
+
+        let mut traversal = make("../../evil.bin", 10, DEFAULT_CHUNK_SIZE, 1);
+        assert!(validate_offer_metadata(&mut traversal).is_ok());
+        assert_eq!(traversal.file_name, "evil.bin");
+
+        let mut parent_only = make("..", 10, DEFAULT_CHUNK_SIZE, 1);
+        assert!(validate_offer_metadata(&mut parent_only).is_err());
+    }
+
+    #[tokio::test]
+    async fn zero_byte_file_has_no_chunks_and_counts_as_complete() {
+        let root = std::env::temp_dir().join(format!("p2p-empty-test-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let file = root.join("empty.bin");
+        tokio::fs::write(&file, b"").await.unwrap();
+
+        let metadata = metadata_for_path(&file).await.unwrap();
+        assert_eq!(metadata.total_chunks, 0);
+        assert_eq!(metadata.file_size, 0);
+
+        let manifest = TransferManifest::new_receiver(metadata, root.join("saved.bin"));
+        assert!(manifest.missing_ranges().is_empty());
+        assert!(manifest.is_complete());
 
         tokio::fs::remove_dir_all(root).await.unwrap();
     }
