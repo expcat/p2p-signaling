@@ -507,19 +507,18 @@ impl P2pChatApp {
         for event in events {
             match event {
                 SessionEvent::Connected => {
-                    if self.state == ConnectionState::Connecting {
-                        self.state = ConnectionState::Connected;
+                    let next_state = state_after_connected_event(self.state);
+                    if next_state != self.state {
+                        self.state = next_state;
+                        self.status = "已连接信令服务，等待对方加入".into();
+                        self.push_system("已连接信令服务。");
                     }
-                    self.status = "已连接信令服务，等待对方加入".into();
-                    self.push_system("已连接信令服务。");
                 }
                 SessionEvent::RoomCodeGenerated(room) => {
                     self.active_room = Some(room);
                 }
                 SessionEvent::PeerConnected => {
-                    self.state = ConnectionState::Paired;
-                    self.status = "已对接，开始聊天或传文件".into();
-                    self.push_system("另一客户端已加入房间。");
+                    self.mark_peer_available(Some("另一客户端已加入房间。"));
                 }
                 SessionEvent::PeerDisconnected => {
                     if self.state == ConnectionState::Paired {
@@ -529,10 +528,12 @@ impl P2pChatApp {
                     self.push_system("对方已离开房间。");
                 }
                 SessionEvent::MessageReceived(text) => {
+                    self.mark_peer_available(None);
                     self.push_message(ChatAuthor::Peer, text);
                     ctx.request_repaint();
                 }
                 SessionEvent::FileOffered(metadata) => {
+                    self.mark_peer_available(None);
                     self.push_system(format!(
                         "对方请求发送文件：{} ({})",
                         metadata.file_name,
@@ -581,6 +582,19 @@ impl P2pChatApp {
                     self.push_system(format!("错误：{message}"));
                 }
             }
+        }
+    }
+
+    fn mark_peer_available(&mut self, system_message: Option<&str>) {
+        let next_state = state_after_peer_activity(self.state, self.handle.is_some());
+        if next_state == self.state {
+            return;
+        }
+
+        self.state = next_state;
+        self.status = "已对接，开始聊天或传文件".into();
+        if let Some(message) = system_message {
+            self.push_system(message);
         }
     }
 
@@ -1184,6 +1198,27 @@ fn can_send_chat(state: ConnectionState, has_handle: bool) -> bool {
     has_handle && state == ConnectionState::Paired
 }
 
+fn state_after_connected_event(state: ConnectionState) -> ConnectionState {
+    match state {
+        ConnectionState::Connecting => ConnectionState::Connected,
+        ConnectionState::Paired => ConnectionState::Paired,
+        ConnectionState::Connected | ConnectionState::Idle => state,
+    }
+}
+
+fn state_after_peer_activity(state: ConnectionState, has_handle: bool) -> ConnectionState {
+    if has_handle
+        && matches!(
+            state,
+            ConnectionState::Connecting | ConnectionState::Connected
+        )
+    {
+        ConnectionState::Paired
+    } else {
+        state
+    }
+}
+
 fn build_signaling_url(server: &str, room: &str) -> anyhow::Result<String> {
     let server = server.trim().trim_end_matches('/');
     let room = room.trim().trim_matches('/');
@@ -1277,5 +1312,33 @@ mod tests {
         assert!(!can_send_chat(ConnectionState::Connected, true));
         assert!(can_send_chat(ConnectionState::Paired, true));
         assert!(!can_send_chat(ConnectionState::Paired, false));
+    }
+
+    #[test]
+    fn connected_event_does_not_downgrade_paired_state() {
+        assert_eq!(
+            state_after_connected_event(ConnectionState::Connecting),
+            ConnectionState::Connected
+        );
+        assert_eq!(
+            state_after_connected_event(ConnectionState::Paired),
+            ConnectionState::Paired
+        );
+    }
+
+    #[test]
+    fn peer_activity_marks_active_session_as_paired() {
+        assert_eq!(
+            state_after_peer_activity(ConnectionState::Connected, true),
+            ConnectionState::Paired
+        );
+        assert_eq!(
+            state_after_peer_activity(ConnectionState::Connecting, true),
+            ConnectionState::Paired
+        );
+        assert_eq!(
+            state_after_peer_activity(ConnectionState::Connected, false),
+            ConnectionState::Connected
+        );
     }
 }
