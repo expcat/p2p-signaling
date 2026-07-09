@@ -121,6 +121,7 @@ impl RangeSet {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct FileMetadata {
     pub transfer_id: String,
     pub file_name: String,
@@ -220,6 +221,7 @@ impl TransferManifest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct FileChunk {
     pub transfer_id: String,
     pub index: u64,
@@ -507,6 +509,26 @@ mod tests {
         assert!(decode_chunk(&chunk).is_ok());
         chunk.hash = sha256_hex(b"other");
         assert!(decode_chunk(&chunk).is_err());
+    }
+
+    #[test]
+    fn file_metadata_reads_current_camel_case_fields() {
+        let camel_case = r#"{
+            "transferId": "file-test",
+            "fileName": "photo.png",
+            "fileSize": 42,
+            "chunkSize": 32768,
+            "totalChunks": 1,
+            "modifiedMillis": 7,
+            "sampleHash": "sample",
+            "fileHash": "hash"
+        }"#;
+
+        let camel: FileMetadata = serde_json::from_str(camel_case).unwrap();
+
+        assert_eq!(camel.transfer_id, "file-test");
+        assert_eq!(camel.file_name, "photo.png");
+        assert_eq!(camel.file_size, 42);
     }
 
     #[tokio::test]

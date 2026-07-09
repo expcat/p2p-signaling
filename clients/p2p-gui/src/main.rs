@@ -151,6 +151,8 @@ struct TransferLine {
 
 #[derive(Debug, Clone, Copy)]
 enum TransferAction {
+    Accept,
+    Reject,
     Pause,
     Resume,
     Cancel,
@@ -173,6 +175,7 @@ struct P2pChatApp {
     active_room: Option<String>,
     message_input: String,
     messages: Vec<ChatLine>,
+    pending_offers: Vec<FileMetadata>,
     transfers: Vec<TransferLine>,
     status: String,
     state: ConnectionState,
@@ -211,6 +214,7 @@ impl P2pChatApp {
             active_room: None,
             message_input: String::new(),
             messages: Vec::new(),
+            pending_offers: Vec::new(),
             transfers: Vec::new(),
             status: "未连接".into(),
             state: ConnectionState::Idle,
@@ -291,6 +295,8 @@ impl P2pChatApp {
                 self.event_rx = Some(event_rx);
                 self.active_room = Some(room.clone());
                 self.messages.clear();
+                self.pending_offers.clear();
+                self.transfers.clear();
                 self.state = ConnectionState::Connecting;
                 self.status = format!("正在连接房间 {room}");
                 self.push_system(format!("房间 {room} {action}，正在连接信令服务。"));
@@ -385,6 +391,8 @@ impl P2pChatApp {
 
         match save_path {
             Some(path) => {
+                self.pending_offers
+                    .retain(|offer| offer.transfer_id != transfer_id);
                 self.push_system(format!("开始接收文件：{}", metadata.file_name));
                 let notice_tx = self.notice_tx.clone();
                 self.runtime.spawn(async move {
@@ -394,19 +402,54 @@ impl P2pChatApp {
                 });
             }
             None => {
-                self.push_system(format!("已拒绝文件：{}", metadata.file_name));
-                let notice_tx = self.notice_tx.clone();
-                self.runtime.spawn(async move {
-                    if let Err(error) = handle.reject_file(transfer_id, "用户取消保存".into()).await
-                    {
-                        let _ = notice_tx.send(UiNotice::Error(format!("拒绝文件失败：{error:#}")));
-                    }
-                });
+                self.push_system(format!(
+                    "已取消选择保存位置，可稍后接收或拒绝：{}",
+                    metadata.file_name
+                ));
             }
         }
     }
 
+    fn reject_file_offer(&mut self, transfer_id: String) {
+        let Some(handle) = self.handle.clone() else {
+            return;
+        };
+
+        let Some(index) = self
+            .pending_offers
+            .iter()
+            .position(|offer| offer.transfer_id == transfer_id)
+        else {
+            return;
+        };
+
+        let metadata = self.pending_offers.remove(index);
+        self.push_system(format!("已拒绝文件：{}", metadata.file_name));
+        let notice_tx = self.notice_tx.clone();
+        self.runtime.spawn(async move {
+            if let Err(error) = handle.reject_file(transfer_id, "用户拒绝接收".into()).await {
+                let _ = notice_tx.send(UiNotice::Error(format!("拒绝文件失败：{error:#}")));
+            }
+        });
+    }
+
+    fn add_pending_offer(&mut self, metadata: FileMetadata) {
+        if let Some(offer) = self
+            .pending_offers
+            .iter_mut()
+            .find(|offer| offer.transfer_id == metadata.transfer_id)
+        {
+            *offer = metadata;
+            return;
+        }
+
+        self.pending_offers.push(metadata);
+    }
+
     fn update_transfer(&mut self, progress: FileTransferProgress) {
+        self.pending_offers
+            .retain(|offer| offer.transfer_id != progress.transfer_id);
+
         if let Some(line) = self
             .transfers
             .iter_mut()
@@ -539,7 +582,7 @@ impl P2pChatApp {
                         metadata.file_name,
                         format_bytes(metadata.file_size)
                     ));
-                    self.accept_file_offer(metadata);
+                    self.add_pending_offer(metadata);
                     ctx.request_repaint();
                 }
                 SessionEvent::FileProgress(progress) => {
@@ -806,7 +849,7 @@ impl eframe::App for P2pChatApp {
         egui::CentralPanel::default().show(ui, |ui| {
             ui.add_space(8.0);
             let mut transfer_action = None;
-            if !self.transfers.is_empty() {
+            if !self.pending_offers.is_empty() || !self.transfers.is_empty() {
                 Frame::new()
                     .fill(Color32::from_rgb(16, 22, 30))
                     .corner_radius(CornerRadius::same(8))
@@ -815,6 +858,12 @@ impl eframe::App for P2pChatApp {
                     .show(ui, |ui| {
                         ui.label(RichText::new("文件传输").strong());
                         ui.add_space(4.0);
+                        for offer in &self.pending_offers {
+                            if let Some(action) = pending_offer_row(ui, offer) {
+                                transfer_action = Some((offer.transfer_id.clone(), action));
+                            }
+                            ui.add_space(6.0);
+                        }
                         for transfer in &self.transfers {
                             if let Some(action) = transfer_row(ui, transfer) {
                                 transfer_action = Some((transfer.transfer_id.clone(), action));
@@ -827,6 +876,17 @@ impl eframe::App for P2pChatApp {
 
             if let Some((transfer_id, action)) = transfer_action {
                 match action {
+                    TransferAction::Accept => {
+                        if let Some(metadata) = self
+                            .pending_offers
+                            .iter()
+                            .find(|offer| offer.transfer_id == transfer_id)
+                            .cloned()
+                        {
+                            self.accept_file_offer(metadata);
+                        }
+                    }
+                    TransferAction::Reject => self.reject_file_offer(transfer_id),
                     TransferAction::Pause => self.pause_transfer(transfer_id),
                     TransferAction::Resume => self.resume_transfer(transfer_id),
                     TransferAction::Cancel => self.cancel_transfer(transfer_id),
@@ -1093,6 +1153,37 @@ fn transfer_row(ui: &mut Ui, transfer: &TransferLine) -> Option<TransferAction> 
                     }
                 }
                 TransferStatus::Complete | TransferStatus::Cancelled => {}
+            }
+        });
+    });
+
+    action
+}
+
+fn pending_offer_row(ui: &mut Ui, metadata: &FileMetadata) -> Option<TransferAction> {
+    let mut action = None;
+
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            ui.set_width(ui.available_width() - 184.0);
+            ui.label(RichText::new(&metadata.file_name).strong());
+            ui.label(
+                RichText::new(format!(
+                    "待接收 · {} · {} 个分段",
+                    format_bytes(metadata.file_size),
+                    metadata.total_chunks
+                ))
+                .small()
+                .color(Color32::from_rgb(158, 169, 185)),
+            );
+        });
+
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if ui.button("拒绝").clicked() {
+                action = Some(TransferAction::Reject);
+            }
+            if ui.button("接收").clicked() {
+                action = Some(TransferAction::Accept);
             }
         });
     });
