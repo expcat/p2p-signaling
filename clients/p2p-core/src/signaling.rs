@@ -136,3 +136,35 @@ impl SignalingClient {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_camel_case_file_offer() {
+        let raw = r#"{
+            "type": "file-offer",
+            "metadata": {
+                "transferId": "file-test",
+                "fileName": "photo.png",
+                "fileSize": 42,
+                "chunkSize": 32768,
+                "totalChunks": 1,
+                "modifiedMillis": null,
+                "sampleHash": "sample",
+                "fileHash": "hash"
+            }
+        }"#;
+
+        let envelope: SignalingEnvelope = serde_json::from_str(raw).unwrap();
+
+        match envelope {
+            SignalingEnvelope::FileOffer { metadata } => {
+                assert_eq!(metadata.transfer_id, "file-test");
+                assert_eq!(metadata.file_name, "photo.png");
+            }
+            other => panic!("expected file offer, got {other:?}"),
+        }
+    }
+}
