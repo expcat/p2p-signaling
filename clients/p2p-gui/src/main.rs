@@ -8,7 +8,6 @@ use eframe::egui::{
     Frame, Layout, RichText, ScrollArea, Stroke, TextEdit, Ui, Vec2,
 };
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
 use tokio::runtime::{Builder, Handle};
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio::sync::oneshot;
@@ -324,7 +323,6 @@ impl P2pChatApp {
                     }
                 });
 
-                let test_handle = handle.clone();
                 self.handle = Some(handle);
                 self.event_rx = Some(ui_event_rx);
                 self.active_room = room.clone();
@@ -343,14 +341,8 @@ impl P2pChatApp {
                     }
                 }
                 if let Some(message) = self.pending_test_message.take() {
-                    self.push_system(format!("将在连接后自动发送测试消息：{message}"));
-                    let notifier = self.notifier.clone();
-                    self.runtime.spawn(async move {
-                        tokio::time::sleep(Duration::from_millis(1500)).await;
-                        if let Err(error) = test_handle.send_text(message).await {
-                            notifier.error(format!("发送测试消息失败：{error:#}"));
-                        }
-                    });
+                    self.pending_test_message = Some(message.clone());
+                    self.push_system(format!("将在直连建立后自动发送测试消息：{message}"));
                 }
             }
             Ok(Err(error)) | Err(error) => {
@@ -397,32 +389,7 @@ impl P2pChatApp {
     }
 
     fn choose_and_send_file(&mut self) {
-        let Some(handle) = self.handle.clone() else {
-            self.push_system("请先创建或加入房间。");
-            return;
-        };
-
-        if !can_send_to_room(self.state, true) {
-            self.push_system("请等待连接房间后再发送文件。");
-            return;
-        }
-
-        let Some(path) = rfd::FileDialog::new().pick_file() else {
-            return;
-        };
-        let label = path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("文件")
-            .to_string();
-        self.push_system(format!("准备发送文件：{label}"));
-
-        let notifier = self.notifier.clone();
-        self.runtime.spawn(async move {
-            if let Err(error) = handle.send_file(path).await {
-                notifier.error(format!("发送文件失败：{error:#}"));
-            }
-        });
+        self.push_system("文件传输将在 Phase 5 接入 QUIC，当前不会回退到 Worker 中继。");
     }
 
     fn accept_file_offer(&mut self, metadata: FileMetadata) {
@@ -573,6 +540,23 @@ impl P2pChatApp {
         self.push_system("连接已断开。");
     }
 
+    fn retry_direct(&mut self) {
+        let Some(handle) = self.handle.clone() else {
+            self.push_system("请先创建或加入房间。");
+            return;
+        };
+
+        self.state = ConnectionState::Paired;
+        self.status = "正在重试直连".into();
+        self.push_system("正在重新收集候选并尝试直连。");
+        let notifier = self.notifier.clone();
+        self.runtime.spawn(async move {
+            if let Err(error) = handle.retry_direct().await {
+                notifier.error(format!("重试直连失败：{error:#}"));
+            }
+        });
+    }
+
     fn poll_background_events(&mut self) {
         while let Ok(notice) = self.notice_rx.try_recv() {
             match notice {
@@ -617,6 +601,9 @@ impl P2pChatApp {
                     self.state = ConnectionState::Direct;
                     self.status = format!("直连已建立：{}", info.remote_addr);
                     self.push_system(format!("直连已建立：{}", info.remote_addr));
+                    if let Some(message) = self.pending_test_message.take() {
+                        self.send_text_message(message);
+                    }
                 }
                 SessionEvent::DirectLinkFailed(message) => {
                     self.state = ConnectionState::DirectFailed;
@@ -632,7 +619,12 @@ impl P2pChatApp {
                     self.mark_peer_available(Some("另一客户端已加入房间。"));
                 }
                 SessionEvent::PeerDisconnected => {
-                    if self.state == ConnectionState::Paired {
+                    if matches!(
+                        self.state,
+                        ConnectionState::Paired
+                            | ConnectionState::Direct
+                            | ConnectionState::DirectFailed
+                    ) {
                         self.state = ConnectionState::Connected;
                     }
                     self.status = "对方已离开，等待重新加入".into();
@@ -697,7 +689,7 @@ impl P2pChatApp {
         }
 
         self.state = next_state;
-        self.status = "已对接，开始聊天或传文件".into();
+        self.status = "已对接，正在建立直连".into();
         if let Some(message) = system_message {
             self.push_system(message);
         }
@@ -896,6 +888,17 @@ impl eframe::App for P2pChatApp {
                     self.join_room();
                 }
 
+                if full_width_button(
+                    ui,
+                    self.handle.is_some() && self.state == ConnectionState::DirectFailed,
+                    "重试直连",
+                    36.0,
+                )
+                .clicked()
+                {
+                    self.retry_direct();
+                }
+
                 ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
                     ui.label(RichText::new(&self.status).color(Color32::from_rgb(158, 169, 185)));
                 });
@@ -979,7 +982,7 @@ impl eframe::App for P2pChatApp {
                 let message_hint = if can_send {
                     "输入消息"
                 } else {
-                    "连接房间后可发送消息"
+                    "直连建立后可发送消息"
                 };
                 let composer_button_width = 86.0 + 76.0 + ui.spacing().item_spacing.x * 2.0;
                 let message_input_width = (ui.available_width() - composer_button_width).max(120.0);
@@ -1006,7 +1009,7 @@ impl eframe::App for P2pChatApp {
 
                 if ui
                     .add_enabled(
-                        can_send,
+                        self.handle.is_some(),
                         egui::Button::new("文件").min_size(Vec2::new(76.0, 32.0)),
                     )
                     .clicked()
@@ -1372,9 +1375,7 @@ fn is_valid_room(room: &str) -> bool {
 }
 
 fn can_send_to_room(state: ConnectionState, has_handle: bool) -> bool {
-    let _ = state;
-    let _ = has_handle;
-    false
+    has_handle && state == ConnectionState::Direct
 }
 
 fn state_after_connected_event(state: ConnectionState) -> ConnectionState {
@@ -1514,7 +1515,8 @@ mod tests {
         assert!(!can_send_to_room(ConnectionState::Connecting, true));
         assert!(!can_send_to_room(ConnectionState::Connected, true));
         assert!(!can_send_to_room(ConnectionState::Paired, true));
-        assert!(!can_send_to_room(ConnectionState::Direct, true));
+        assert!(can_send_to_room(ConnectionState::Direct, true));
+        assert!(!can_send_to_room(ConnectionState::DirectFailed, true));
         assert!(!can_send_to_room(ConnectionState::Paired, false));
     }
 

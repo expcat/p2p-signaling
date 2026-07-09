@@ -5,8 +5,6 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-use crate::transfer::{ChunkRange, FileChunk, FileMetadata};
-
 #[derive(Debug, Clone)]
 pub struct SignalingClient {
     url: String,
@@ -45,46 +43,6 @@ pub enum SignalingEnvelope {
     },
     Signal {
         payload: Value,
-    },
-    Chat {
-        text: String,
-    },
-    FileOffer {
-        metadata: FileMetadata,
-    },
-    FileAccept {
-        #[serde(rename = "transferId")]
-        transfer_id: String,
-        missing: Vec<ChunkRange>,
-    },
-    FileReject {
-        #[serde(rename = "transferId")]
-        transfer_id: String,
-        reason: String,
-    },
-    FileResume {
-        #[serde(rename = "transferId")]
-        transfer_id: String,
-        missing: Vec<ChunkRange>,
-    },
-    FileChunk {
-        chunk: FileChunk,
-    },
-    FileAck {
-        #[serde(rename = "transferId")]
-        transfer_id: String,
-        received: Vec<ChunkRange>,
-    },
-    FileComplete {
-        #[serde(rename = "transferId")]
-        transfer_id: String,
-        #[serde(rename = "fileHash")]
-        file_hash: String,
-    },
-    FileCancel {
-        #[serde(rename = "transferId")]
-        transfer_id: String,
-        reason: String,
     },
     Error {
         message: String,
@@ -145,29 +103,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_camel_case_file_offer() {
+    fn parses_camel_case_room_ready() {
         let raw = r#"{
-            "type": "file-offer",
-            "metadata": {
-                "transferId": "file-test",
-                "fileName": "photo.png",
-                "fileSize": 42,
-                "chunkSize": 32768,
-                "totalChunks": 1,
-                "modifiedMillis": null,
-                "sampleHash": "sample",
-                "fileHash": "hash"
-            }
+            "type": "room-ready",
+            "roomCode": "1234"
         }"#;
 
         let envelope: SignalingEnvelope = serde_json::from_str(raw).unwrap();
 
         match envelope {
-            SignalingEnvelope::FileOffer { metadata } => {
-                assert_eq!(metadata.transfer_id, "file-test");
-                assert_eq!(metadata.file_name, "photo.png");
+            SignalingEnvelope::RoomReady { room_code } => {
+                assert_eq!(room_code.as_deref(), Some("1234"));
             }
-            other => panic!("expected file offer, got {other:?}"),
+            other => panic!("expected room ready, got {other:?}"),
         }
     }
 }

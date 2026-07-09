@@ -1,5 +1,6 @@
 pub mod direct;
 pub mod nat;
+pub mod p2p_proto;
 pub mod session;
 pub mod signaling;
 pub mod transfer;

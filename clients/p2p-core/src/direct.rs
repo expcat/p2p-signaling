@@ -9,17 +9,16 @@ use quinn::rustls::client::danger::{
 };
 use quinn::rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use quinn::rustls::{self, CertificateError, DigitallySignedStruct, SignatureScheme};
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::time::{timeout, Instant};
 
 use crate::nat::{Candidate, CandidateKind, PreparedConnectInfo};
+use crate::p2p_proto::{read_p2p_message, write_p2p_message, P2pMessage};
 use crate::signaling::SignalingRole;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const PUNCH_INTERVAL: Duration = Duration::from_millis(200);
 const PUNCH_BYTES: &[u8] = b"p2p-signaling-hole-punch-v1";
-const CONTROL_LIMIT: usize = 4096;
 const SERVER_NAME: &str = "p2p.local";
 
 #[derive(Debug, Clone)]
@@ -31,16 +30,17 @@ pub struct DirectLinkInfo {
 pub struct DirectLink {
     connection: quinn::Connection,
     endpoint: quinn::Endpoint,
+    control_send: quinn::SendStream,
+    control_recv: quinn::RecvStream,
     info: DirectLinkInfo,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "kebab-case")]
-enum DirectControl {
-    Hello {
-        #[serde(rename = "pairingToken")]
-        pairing_token: String,
-    },
+pub struct DirectLinkParts {
+    pub connection: quinn::Connection,
+    pub endpoint: quinn::Endpoint,
+    pub control_send: quinn::SendStream,
+    pub control_recv: quinn::RecvStream,
+    pub info: DirectLinkInfo,
 }
 
 impl DirectLink {
@@ -48,10 +48,14 @@ impl DirectLink {
         &self.info
     }
 
-    pub async fn closed_reason(self) -> String {
-        let reason = self.connection.closed().await;
-        self.endpoint.wait_idle().await;
-        reason.to_string()
+    pub fn into_parts(self) -> DirectLinkParts {
+        DirectLinkParts {
+            connection: self.connection,
+            endpoint: self.endpoint,
+            control_send: self.control_send,
+            control_recv: self.control_recv,
+            info: self.info,
+        }
     }
 }
 
@@ -80,12 +84,13 @@ async fn accept_direct_link(
     let accepted = timeout(CONNECT_TIMEOUT, async {
         let incoming = endpoint.accept().await.context("未收到 QUIC 连接")?;
         let accepted = incoming.await.context("QUIC 握手失败")?;
-        verify_host_control(&accepted, &local.info.pairing_token, &peer.pairing_token).await?;
-        Ok::<_, anyhow::Error>(accepted)
+        let (control_send, control_recv) =
+            verify_host_control(&accepted, &local.info.pairing_token, &peer.pairing_token).await?;
+        Ok::<_, anyhow::Error>((accepted, control_send, control_recv))
     })
     .await;
     punch_task.abort();
-    let accepted = accepted.context("直连建立超时")??;
+    let (accepted, control_send, control_recv) = accepted.context("直连建立超时")??;
     let info = DirectLinkInfo {
         remote_addr: accepted.remote_address(),
         local_role: SignalingRole::Host,
@@ -94,6 +99,8 @@ async fn accept_direct_link(
     Ok(DirectLink {
         connection: accepted,
         endpoint,
+        control_send,
+        control_recv,
         info,
     })
 }
@@ -126,13 +133,14 @@ async fn dial_direct_link(
             let connection = connecting
                 .await
                 .with_context(|| format!("QUIC 握手失败 {}", candidate.addr))?;
-            verify_guest_control(&connection, &local.info.pairing_token, &peer.pairing_token)
-                .await?;
-            Ok::<_, anyhow::Error>(connection)
+            let (control_send, control_recv) =
+                verify_guest_control(&connection, &local.info.pairing_token, &peer.pairing_token)
+                    .await?;
+            Ok::<_, anyhow::Error>((connection, control_send, control_recv))
         };
 
         match timeout(remaining, attempt).await {
-            Ok(Ok(connection)) => {
+            Ok(Ok((connection, control_send, control_recv))) => {
                 punch_task.abort();
                 let info = DirectLinkInfo {
                     remote_addr: connection.remote_address(),
@@ -141,6 +149,8 @@ async fn dial_direct_link(
                 return Ok(DirectLink {
                     connection,
                     endpoint,
+                    control_send,
+                    control_recv,
                     info,
                 });
             }
@@ -200,41 +210,51 @@ async fn verify_guest_control(
     connection: &quinn::Connection,
     local_token: &str,
     peer_token: &str,
-) -> Result<()> {
+) -> Result<(quinn::SendStream, quinn::RecvStream)> {
     let (mut send, mut recv) = connection.open_bi().await?;
     write_hello(&mut send, local_token).await?;
     let hello = read_hello(&mut recv).await?;
-    ensure_token(&hello, peer_token)
+    ensure_token(&hello, peer_token)?;
+    Ok((send, recv))
 }
 
 async fn verify_host_control(
     connection: &quinn::Connection,
     local_token: &str,
     peer_token: &str,
-) -> Result<()> {
+) -> Result<(quinn::SendStream, quinn::RecvStream)> {
     let (mut send, mut recv) = connection.accept_bi().await?;
     let hello = read_hello(&mut recv).await?;
     ensure_token(&hello, peer_token)?;
-    write_hello(&mut send, local_token).await
+    write_hello(&mut send, local_token).await?;
+    Ok((send, recv))
 }
 
 async fn write_hello(send: &mut quinn::SendStream, token: &str) -> Result<()> {
-    let payload = serde_json::to_vec(&DirectControl::Hello {
-        pairing_token: token.to_string(),
-    })?;
-    send.write_all(&payload).await?;
-    send.finish()?;
-    Ok(())
+    write_p2p_message(
+        send,
+        &P2pMessage::Hello {
+            token: token.to_string(),
+        },
+    )
+    .await
 }
 
 async fn read_hello(recv: &mut quinn::RecvStream) -> Result<DirectControl> {
-    let bytes = recv.read_to_end(CONTROL_LIMIT).await?;
-    serde_json::from_slice(&bytes).context("直连 Hello 帧无效")
+    match read_p2p_message(recv).await? {
+        P2pMessage::Hello { token } => Ok(DirectControl::Hello { token }),
+        message => anyhow::bail!("直连首帧不是 Hello：{message:?}"),
+    }
+}
+
+#[derive(Debug)]
+enum DirectControl {
+    Hello { token: String },
 }
 
 fn ensure_token(hello: &DirectControl, expected: &str) -> Result<()> {
     match hello {
-        DirectControl::Hello { pairing_token } if pairing_token == expected => Ok(()),
+        DirectControl::Hello { token } if token == expected => Ok(()),
         DirectControl::Hello { .. } => anyhow::bail!("直连配对令牌不匹配"),
     }
 }
