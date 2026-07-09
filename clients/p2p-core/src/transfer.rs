@@ -288,8 +288,12 @@ impl TransferStore {
                 continue;
             }
 
-            let text = tokio::fs::read_to_string(entry.path()).await?;
-            let manifest = serde_json::from_str::<TransferManifest>(&text)?;
+            let Ok(text) = tokio::fs::read_to_string(entry.path()).await else {
+                continue;
+            };
+            let Ok(manifest) = serde_json::from_str::<TransferManifest>(&text) else {
+                continue;
+            };
             if !matches!(
                 manifest.status,
                 TransferStatus::Complete | TransferStatus::Cancelled
@@ -622,6 +626,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn load_pending_skips_unreadable_or_corrupt_manifests() {
+        let root = std::env::temp_dir().join(format!("p2p-pending-test-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let store = TransferStore::new(root.clone());
+        let manifest = TransferManifest::new_sender(
+            FileMetadata {
+                transfer_id: "file-valid".into(),
+                file_name: "a.bin".into(),
+                file_size: 3,
+                chunk_size: DEFAULT_CHUNK_SIZE,
+                total_chunks: 1,
+                modified_millis: Some(1),
+                sample_hash: "sample".into(),
+                file_hash: "hash".into(),
+            },
+            PathBuf::from("/tmp/a.bin"),
+        );
+
+        store.save(&manifest).await.unwrap();
+        tokio::fs::write(root.join("broken.json"), b"{not valid json")
+            .await
+            .unwrap();
+
+        let pending = store.load_pending().await.unwrap();
+
+        assert_eq!(pending, vec![manifest]);
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn metadata_transfer_id_is_stable_for_same_file() {
         let root = std::env::temp_dir().join(format!("p2p-metadata-test-{}", Uuid::new_v4()));
         tokio::fs::create_dir_all(&root).await.unwrap();
@@ -638,8 +672,8 @@ mod tests {
 
     #[test]
     fn offer_metadata_validation_rejects_malicious_values() {
-        let make = |file_name: &str, file_size: u64, chunk_size: u64, total_chunks: u64| {
-            FileMetadata {
+        let make =
+            |file_name: &str, file_size: u64, chunk_size: u64, total_chunks: u64| FileMetadata {
                 transfer_id: "file-test".into(),
                 file_name: file_name.into(),
                 file_size,
@@ -648,8 +682,7 @@ mod tests {
                 modified_millis: None,
                 sample_hash: "sample".into(),
                 file_hash: "hash".into(),
-            }
-        };
+            };
 
         let mut valid = make("a.bin", DEFAULT_CHUNK_SIZE + 1, DEFAULT_CHUNK_SIZE, 2);
         assert!(validate_offer_metadata(&mut valid).is_ok());

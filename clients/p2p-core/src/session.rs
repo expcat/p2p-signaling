@@ -144,20 +144,30 @@ impl ChatSession {
         let dispatch_events = event_tx.clone();
         let dispatch_transfer_tx = transfer_tx.clone();
         tokio::spawn(async move {
+            let mut peer_seen = false;
             while let Some(raw) = incoming_rx.recv().await {
                 match serde_json::from_str::<SignalingEnvelope>(&raw) {
                     Ok(SignalingEnvelope::Chat { text }) => {
+                        if should_announce_peer(&mut peer_seen) {
+                            let _ = dispatch_events.send(SessionEvent::PeerConnected).await;
+                            let _ = dispatch_transfer_tx
+                                .send(TransferCommand::PeerAvailable)
+                                .await;
+                        }
                         let _ = dispatch_events
                             .send(SessionEvent::MessageReceived(text))
                             .await;
                     }
                     Ok(SignalingEnvelope::PeerJoined { .. }) => {
-                        let _ = dispatch_events.send(SessionEvent::PeerConnected).await;
-                        let _ = dispatch_transfer_tx
-                            .send(TransferCommand::PeerAvailable)
-                            .await;
+                        if should_announce_peer(&mut peer_seen) {
+                            let _ = dispatch_events.send(SessionEvent::PeerConnected).await;
+                            let _ = dispatch_transfer_tx
+                                .send(TransferCommand::PeerAvailable)
+                                .await;
+                        }
                     }
                     Ok(SignalingEnvelope::PeerLeft { .. }) => {
+                        peer_seen = false;
                         let _ = dispatch_events.send(SessionEvent::PeerDisconnected).await;
                     }
                     Ok(SignalingEnvelope::Error { message }) => {
@@ -174,6 +184,12 @@ impl ChatSession {
                     | Ok(envelope @ SignalingEnvelope::FileAck { .. })
                     | Ok(envelope @ SignalingEnvelope::FileComplete { .. })
                     | Ok(envelope @ SignalingEnvelope::FileCancel { .. }) => {
+                        if should_announce_peer(&mut peer_seen) {
+                            let _ = dispatch_events.send(SessionEvent::PeerConnected).await;
+                            let _ = dispatch_transfer_tx
+                                .send(TransferCommand::PeerAvailable)
+                                .await;
+                        }
                         let _ = peer_file_tx.send(envelope).await;
                     }
                     Ok(SignalingEnvelope::Signal { .. }) => {}
@@ -998,6 +1014,15 @@ impl TransferRuntime {
     }
 }
 
+fn should_announce_peer(peer_seen: &mut bool) -> bool {
+    if *peer_seen {
+        false
+    } else {
+        *peer_seen = true;
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1027,5 +1052,16 @@ mod tests {
         };
 
         assert_eq!(manifest.completed_bytes(), DEFAULT_CHUNK_SIZE + 7);
+    }
+
+    #[test]
+    fn peer_announcement_only_fires_for_first_peer_event() {
+        let mut peer_seen = false;
+
+        assert!(should_announce_peer(&mut peer_seen));
+        assert!(!should_announce_peer(&mut peer_seen));
+
+        peer_seen = false;
+        assert!(should_announce_peer(&mut peer_seen));
     }
 }

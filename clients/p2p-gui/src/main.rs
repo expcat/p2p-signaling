@@ -15,9 +15,7 @@ use tokio::sync::mpsc as tokio_mpsc;
 use tokio::sync::oneshot;
 
 use p2p_core::transfer::{FileMetadata, TransferDirection, TransferStatus};
-use p2p_core::{
-    ChatSession, ChatSessionHandle, FileTransferProgress, SessionEvent, SessionRole,
-};
+use p2p_core::{ChatSession, ChatSessionHandle, FileTransferProgress, SessionEvent, SessionRole};
 
 const DEFAULT_SERVER: &str = "p2p-signaling.yizhe.studio";
 const DEFAULT_ROOM: &str = "";
@@ -359,8 +357,8 @@ impl P2pChatApp {
             return;
         }
 
-        if !can_send_chat(self.state, self.handle.is_some()) {
-            self.push_system("请等待另一客户端加入后再发送消息。");
+        if !can_send_to_room(self.state, self.handle.is_some()) {
+            self.push_system("请等待连接房间后再发送消息。");
             return;
         }
 
@@ -389,6 +387,11 @@ impl P2pChatApp {
             self.push_system("请先创建或加入房间。");
             return;
         };
+
+        if !can_send_to_room(self.state, true) {
+            self.push_system("请等待连接房间后再发送文件。");
+            return;
+        }
 
         let Some(path) = rfd::FileDialog::new().pick_file() else {
             return;
@@ -939,27 +942,27 @@ impl eframe::App for P2pChatApp {
 
             ui.add_space(10.0);
             ui.horizontal(|ui| {
-                let can_send_chat = can_send_chat(self.state, self.handle.is_some());
-                let message_hint = if can_send_chat {
+                let can_send = can_send_to_room(self.state, self.handle.is_some());
+                let message_hint = if can_send {
                     "输入消息"
                 } else {
-                    "等待对方加入后可发送消息"
+                    "连接房间后可发送消息"
                 };
                 let composer_button_width = 86.0 + 76.0 + ui.spacing().item_spacing.x * 2.0;
                 let message_input_width = (ui.available_width() - composer_button_width).max(120.0);
                 let response = ui.add_enabled(
-                    can_send_chat,
+                    can_send,
                     TextEdit::singleline(&mut self.message_input)
                         .hint_text(message_hint)
                         .desired_width(message_input_width),
                 );
-                let send_pressed = can_send_chat
+                let send_pressed = can_send
                     && response.lost_focus()
                     && ui.input(|input| input.key_pressed(egui::Key::Enter));
 
                 if ui
                     .add_enabled(
-                        can_send_chat,
+                        can_send,
                         egui::Button::new("发送").min_size(Vec2::new(86.0, 32.0)),
                     )
                     .clicked()
@@ -970,7 +973,7 @@ impl eframe::App for P2pChatApp {
 
                 if ui
                     .add_enabled(
-                        self.handle.is_some(),
+                        can_send,
                         egui::Button::new("文件").min_size(Vec2::new(76.0, 32.0)),
                     )
                     .clicked()
@@ -1300,8 +1303,8 @@ fn is_valid_room(room: &str) -> bool {
     room.len() == 4 && room.chars().all(|character| character.is_ascii_digit())
 }
 
-fn can_send_chat(state: ConnectionState, has_handle: bool) -> bool {
-    has_handle && state == ConnectionState::Paired
+fn can_send_to_room(state: ConnectionState, has_handle: bool) -> bool {
+    has_handle && matches!(state, ConnectionState::Connected | ConnectionState::Paired)
 }
 
 fn state_after_connected_event(state: ConnectionState) -> ConnectionState {
@@ -1413,11 +1416,11 @@ mod tests {
 
     #[test]
     fn chat_send_requires_peer_connection() {
-        assert!(!can_send_chat(ConnectionState::Idle, false));
-        assert!(!can_send_chat(ConnectionState::Connecting, true));
-        assert!(!can_send_chat(ConnectionState::Connected, true));
-        assert!(can_send_chat(ConnectionState::Paired, true));
-        assert!(!can_send_chat(ConnectionState::Paired, false));
+        assert!(!can_send_to_room(ConnectionState::Idle, false));
+        assert!(!can_send_to_room(ConnectionState::Connecting, true));
+        assert!(can_send_to_room(ConnectionState::Connected, true));
+        assert!(can_send_to_room(ConnectionState::Paired, true));
+        assert!(!can_send_to_room(ConnectionState::Paired, false));
     }
 
     #[test]
