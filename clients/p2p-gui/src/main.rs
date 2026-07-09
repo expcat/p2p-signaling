@@ -324,6 +324,11 @@ impl P2pChatApp {
             return;
         }
 
+        if !can_send_chat(self.state, self.handle.is_some()) {
+            self.push_system("请等待另一客户端加入后再发送消息。");
+            return;
+        }
+
         self.message_input.clear();
         self.send_text_message(text);
     }
@@ -839,18 +844,25 @@ impl eframe::App for P2pChatApp {
 
             ui.add_space(10.0);
             ui.horizontal(|ui| {
+                let can_send_chat = can_send_chat(self.state, self.handle.is_some());
+                let message_hint = if can_send_chat {
+                    "输入消息"
+                } else {
+                    "等待对方加入后可发送消息"
+                };
                 let response = ui.add_enabled(
-                    self.handle.is_some(),
+                    can_send_chat,
                     TextEdit::singleline(&mut self.message_input)
-                        .hint_text("输入消息")
+                        .hint_text(message_hint)
                         .desired_width(f32::INFINITY),
                 );
-                let send_pressed =
-                    response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                let send_pressed = can_send_chat
+                    && response.lost_focus()
+                    && ui.input(|input| input.key_pressed(egui::Key::Enter));
 
                 if ui
                     .add_enabled(
-                        self.handle.is_some(),
+                        can_send_chat,
                         egui::Button::new("发送").min_size(Vec2::new(86.0, 32.0)),
                     )
                     .clicked()
@@ -1164,6 +1176,10 @@ fn is_valid_room(room: &str) -> bool {
     room.len() == 4 && room.chars().all(|character| character.is_ascii_digit())
 }
 
+fn can_send_chat(state: ConnectionState, has_handle: bool) -> bool {
+    has_handle && state == ConnectionState::Paired
+}
+
 fn build_signaling_url(server: &str, room: &str) -> anyhow::Result<String> {
     let server = server.trim().trim_end_matches('/');
     let room = room.trim().trim_matches('/');
@@ -1248,5 +1264,14 @@ mod tests {
         assert_eq!(normalize_room_input("A12-345"), "1234");
         assert!(is_valid_room("0000"));
         assert!(!is_valid_room("123"));
+    }
+
+    #[test]
+    fn chat_send_requires_peer_connection() {
+        assert!(!can_send_chat(ConnectionState::Idle, false));
+        assert!(!can_send_chat(ConnectionState::Connecting, true));
+        assert!(!can_send_chat(ConnectionState::Connected, true));
+        assert!(can_send_chat(ConnectionState::Paired, true));
+        assert!(!can_send_chat(ConnectionState::Paired, false));
     }
 }
