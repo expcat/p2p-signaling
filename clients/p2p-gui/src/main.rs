@@ -827,14 +827,7 @@ impl eframe::App for P2pChatApp {
                 ui.add_space(8.0);
 
                 let can_connect = !self.server.trim().is_empty();
-                if ui
-                    .add_enabled(
-                        can_connect,
-                        egui::Button::new("创建 4 位随机房间")
-                            .min_size(Vec2::new(f32::INFINITY, 36.0)),
-                    )
-                    .clicked()
-                {
+                if full_width_button(ui, can_connect, "创建 4 位随机房间", 36.0).clicked() {
                     self.create_room();
                 }
 
@@ -852,12 +845,13 @@ impl eframe::App for P2pChatApp {
 
                 let join_pressed = room_response.lost_focus()
                     && ui.input(|input| input.key_pressed(egui::Key::Enter));
-                if ui
-                    .add_enabled(
-                        can_connect && is_valid_room(&self.room_input),
-                        egui::Button::new("加入房间").min_size(Vec2::new(f32::INFINITY, 36.0)),
-                    )
-                    .clicked()
+                if full_width_button(
+                    ui,
+                    can_connect && is_valid_room(&self.room_input),
+                    "加入房间",
+                    36.0,
+                )
+                .clicked()
                     || join_pressed
                 {
                     self.join_room();
@@ -1113,6 +1107,26 @@ fn bubble(ui: &mut Ui, name: &str, text: &str, color: Color32) {
         });
 }
 
+fn full_width_button(ui: &mut Ui, enabled: bool, label: &str, height: f32) -> egui::Response {
+    let width = finite_width(ui.available_width(), 120.0);
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(label).min_size(Vec2::new(width, height)),
+    )
+}
+
+fn row_text_width(available_width: f32) -> f32 {
+    finite_width(available_width - 184.0, 120.0)
+}
+
+fn finite_width(width: f32, fallback: f32) -> f32 {
+    if width.is_finite() && width > 0.0 {
+        width
+    } else {
+        fallback
+    }
+}
+
 fn transfer_row(ui: &mut Ui, transfer: &TransferLine) -> Option<TransferAction> {
     let mut action = None;
     let fraction = if transfer.total_bytes == 0 {
@@ -1120,6 +1134,7 @@ fn transfer_row(ui: &mut Ui, transfer: &TransferLine) -> Option<TransferAction> 
     } else {
         (transfer.completed_bytes as f32 / transfer.total_bytes as f32).clamp(0.0, 1.0)
     };
+    let text_width = row_text_width(ui.available_width());
 
     ui.horizontal(|ui| {
         let direction = match transfer.direction {
@@ -1129,7 +1144,7 @@ fn transfer_row(ui: &mut Ui, transfer: &TransferLine) -> Option<TransferAction> 
         let status = transfer_status_label(&transfer.status);
 
         ui.vertical(|ui| {
-            ui.set_width(ui.available_width() - 184.0);
+            ui.set_width(text_width);
             ui.label(RichText::new(&transfer.file_name).strong());
             ui.label(
                 RichText::new(format!(
@@ -1142,7 +1157,7 @@ fn transfer_row(ui: &mut Ui, transfer: &TransferLine) -> Option<TransferAction> 
             );
             ui.add(
                 egui::ProgressBar::new(fraction)
-                    .desired_width(f32::INFINITY)
+                    .desired_width(text_width)
                     .show_percentage(),
             );
         });
@@ -1180,10 +1195,11 @@ fn transfer_row(ui: &mut Ui, transfer: &TransferLine) -> Option<TransferAction> 
 
 fn pending_offer_row(ui: &mut Ui, metadata: &FileMetadata) -> Option<TransferAction> {
     let mut action = None;
+    let text_width = row_text_width(ui.available_width());
 
     ui.horizontal(|ui| {
         ui.vertical(|ui| {
-            ui.set_width(ui.available_width() - 184.0);
+            ui.set_width(text_width);
             ui.label(RichText::new(&metadata.file_name).strong());
             ui.label(
                 RichText::new(format!(
@@ -1449,5 +1465,13 @@ mod tests {
             state_after_peer_activity(ConnectionState::Connected, false),
             ConnectionState::Connected
         );
+    }
+
+    #[test]
+    fn row_widths_never_produce_infinite_layout_sizes() {
+        assert_eq!(finite_width(f32::INFINITY, 120.0), 120.0);
+        assert_eq!(finite_width(f32::NAN, 120.0), 120.0);
+        assert_eq!(row_text_width(f32::INFINITY), 120.0);
+        assert_eq!(row_text_width(420.0), 236.0);
     }
 }
