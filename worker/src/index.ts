@@ -7,15 +7,6 @@ type ClientRole = "host" | "guest";
 type SignalEnvelope =
   | { type: "hello"; role: ClientRole; roomCode?: string }
   | { type: "signal"; payload: unknown }
-  | { type: "chat"; text: string }
-  | { type: "file-offer"; metadata: unknown }
-  | { type: "file-accept"; transferId: string; missing: unknown[] }
-  | { type: "file-reject"; transferId: string; reason: string }
-  | { type: "file-resume"; transferId: string; missing: unknown[] }
-  | { type: "file-chunk"; chunk: unknown }
-  | { type: "file-ack"; transferId: string; received: unknown[] }
-  | { type: "file-complete"; transferId: string; fileHash: string }
-  | { type: "file-cancel"; transferId: string; reason: string }
   | { type: "bye" };
 
 function json(data: unknown, init: ResponseInit = {}): Response {
@@ -198,26 +189,10 @@ export class RoomObject {
     switch (envelope.type) {
       case "hello":
         return envelope.role === "host" || envelope.role === "guest";
-      case "chat":
-        return typeof envelope.text === "string";
       case "signal":
         return "payload" in envelope;
       case "bye":
         return true;
-      case "file-offer":
-        return "metadata" in envelope;
-      case "file-accept":
-      case "file-resume":
-        return typeof envelope.transferId === "string" && Array.isArray(envelope.missing);
-      case "file-reject":
-      case "file-cancel":
-        return typeof envelope.transferId === "string" && typeof envelope.reason === "string";
-      case "file-chunk":
-        return "chunk" in envelope;
-      case "file-ack":
-        return typeof envelope.transferId === "string" && Array.isArray(envelope.received);
-      case "file-complete":
-        return typeof envelope.transferId === "string" && typeof envelope.fileHash === "string";
       default:
         return false;
     }

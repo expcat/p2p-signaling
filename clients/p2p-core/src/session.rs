@@ -4,12 +4,13 @@ use std::path::PathBuf;
 use anyhow::Result;
 use tokio::sync::mpsc;
 
-use crate::nat::{collect_connect_info, ConnectInfo};
+use crate::direct::{establish_direct_link, DirectLinkInfo};
+use crate::nat::{prepare_connect_info, ConnectInfo, PreparedConnectInfo};
 use crate::signaling::{SignalingClient, SignalingCommand, SignalingEnvelope, SignalingRole};
 use crate::transfer::{
-    decode_chunk, hash_file, metadata_for_path, open_chunk_sink, open_chunk_source,
-    read_chunk_from, validate_offer_metadata, write_chunk_to, ChunkRange, FileMetadata, RangeSet,
-    TransferDirection, TransferManifest, TransferStatus, TransferStore,
+    decode_chunk, hash_file, open_chunk_sink, open_chunk_source, read_chunk_from,
+    validate_offer_metadata, write_chunk_to, ChunkRange, FileMetadata, RangeSet, TransferDirection,
+    TransferManifest, TransferStatus, TransferStore,
 };
 
 /// 接收端每收到多少个分块就持久化一次 manifest 并回执一次 FileAck/进度。
@@ -41,6 +42,9 @@ pub enum SessionEvent {
     RoomCodeAssigned(String),
     LocalCandidatesCollected(ConnectInfo),
     PeerCandidatesReceived(ConnectInfo),
+    DirectLinkEstablished(DirectLinkInfo),
+    DirectLinkFailed(String),
+    DirectLinkLost(String),
     PeerConnected,
     PeerDisconnected,
     MessageReceived(String),
@@ -78,7 +82,6 @@ pub struct ChatSessionHandle {
 
 #[derive(Debug)]
 enum TransferCommand {
-    SendFile(PathBuf),
     AcceptFile {
         transfer_id: String,
         save_path: PathBuf,
@@ -155,8 +158,30 @@ impl ChatSession {
         tokio::spawn(async move {
             let mut peer_seen = false;
             let mut connect_info_sent = false;
-            while let Some(raw) = incoming_rx.recv().await {
-                match serde_json::from_str::<SignalingEnvelope>(&raw) {
+            let mut local_direct = None;
+            let mut peer_direct = None;
+            let mut direct_started = false;
+            let (direct_ready_tx, mut direct_ready_rx) = mpsc::channel::<PreparedConnectInfo>(1);
+
+            loop {
+                tokio::select! {
+                    prepared = direct_ready_rx.recv() => {
+                        let Some(prepared) = prepared else {
+                            continue;
+                        };
+                        local_direct = Some(prepared);
+                        start_direct_link_once(
+                            &mut direct_started,
+                            &mut local_direct,
+                            peer_direct.clone(),
+                            dispatch_events.clone(),
+                        );
+                    }
+                    raw = incoming_rx.recv() => {
+                        let Some(raw) = raw else {
+                            break;
+                        };
+                        match serde_json::from_str::<SignalingEnvelope>(&raw) {
                     Ok(SignalingEnvelope::Chat { text }) => {
                         if should_announce_peer(&mut peer_seen) {
                             let _ = dispatch_events.send(SessionEvent::PeerConnected).await;
@@ -180,6 +205,7 @@ impl ChatSession {
                             signaling_role.clone(),
                             dispatch_commands.clone(),
                             dispatch_events.clone(),
+                            direct_ready_tx.clone(),
                         );
                     }
                     Ok(SignalingEnvelope::PeerLeft { .. }) => {
@@ -202,6 +228,7 @@ impl ChatSession {
                                 signaling_role.clone(),
                                 dispatch_commands.clone(),
                                 dispatch_events.clone(),
+                                direct_ready_tx.clone(),
                             );
                         }
                     }
@@ -231,14 +258,23 @@ impl ChatSession {
                                         .await;
                                 }
                                 let _ = dispatch_events
-                                    .send(SessionEvent::PeerCandidatesReceived(info))
+                                    .send(SessionEvent::PeerCandidatesReceived(info.clone()))
                                     .await;
+                                peer_direct = Some(info.clone());
+                                start_direct_link_once(
+                                    &mut direct_started,
+                                    &mut local_direct,
+                                    peer_direct.clone(),
+                                    dispatch_events.clone(),
+                                );
                             }
                         }
                     }
                     Ok(SignalingEnvelope::Hello { .. }) | Ok(SignalingEnvelope::Bye) => {}
                     // 无法解析的帧是协议噪声，不能冒充对方的聊天消息
                     Err(_) => {}
+                        }
+                    }
                 }
             }
         });
@@ -277,6 +313,7 @@ fn announce_connect_info_once(
     role: SignalingRole,
     command_tx: mpsc::Sender<SignalingCommand>,
     event_tx: mpsc::Sender<SessionEvent>,
+    direct_ready_tx: mpsc::Sender<PreparedConnectInfo>,
 ) {
     if *sent {
         return;
@@ -284,8 +321,9 @@ fn announce_connect_info_once(
     *sent = true;
 
     tokio::spawn(async move {
-        match collect_connect_info(role).await {
-            Ok(info) => {
+        match prepare_connect_info(role).await {
+            Ok(prepared) => {
+                let info = prepared.info.clone();
                 let payload = match serde_json::to_value(&info) {
                     Ok(payload) => payload,
                     Err(error) => {
@@ -308,7 +346,9 @@ fn announce_connect_info_once(
                             let _ = event_tx
                                 .send(SessionEvent::Error(format!("发送候选信息失败：{error}")))
                                 .await;
+                            return;
                         }
+                        let _ = direct_ready_tx.send(prepared).await;
                     }
                     Err(error) => {
                         let _ = event_tx
@@ -328,20 +368,53 @@ fn announce_connect_info_once(
     });
 }
 
+fn start_direct_link_once(
+    started: &mut bool,
+    local: &mut Option<PreparedConnectInfo>,
+    peer: Option<ConnectInfo>,
+    event_tx: mpsc::Sender<SessionEvent>,
+) {
+    if *started {
+        return;
+    }
+
+    let Some(prepared) = local.take() else {
+        return;
+    };
+    let Some(peer) = peer else {
+        *local = Some(prepared);
+        return;
+    };
+
+    *started = true;
+    tokio::spawn(async move {
+        match establish_direct_link(prepared, peer).await {
+            Ok(link) => {
+                let info = link.info().clone();
+                let _ = event_tx
+                    .send(SessionEvent::DirectLinkEstablished(info))
+                    .await;
+                let reason = link.closed_reason().await;
+                let _ = event_tx.send(SessionEvent::DirectLinkLost(reason)).await;
+            }
+            Err(error) => {
+                let _ = event_tx
+                    .send(SessionEvent::DirectLinkFailed(format!("{error:#}")))
+                    .await;
+            }
+        }
+    });
+}
+
 impl ChatSessionHandle {
     pub async fn send_text(&self, text: String) -> Result<()> {
-        let message = serde_json::to_string(&SignalingEnvelope::Chat { text })?;
-        self.command_tx
-            .send(SignalingCommand::SendText(message))
-            .await?;
-        Ok(())
+        let _ = text;
+        anyhow::bail!("聊天已禁止通过 Worker 中继，直连聊天将在 Phase 4 接入")
     }
 
     pub async fn send_file(&self, path: PathBuf) -> Result<()> {
-        self.transfer_tx
-            .send(TransferCommand::SendFile(path))
-            .await?;
-        Ok(())
+        let _ = path;
+        anyhow::bail!("文件已禁止通过 Worker 中继，直连文件传输将在 Phase 5 接入")
     }
 
     pub async fn accept_file(&self, transfer_id: String, save_path: PathBuf) -> Result<()> {
@@ -481,7 +554,6 @@ impl TransferRuntime {
 
     async fn handle_command(&mut self, command: TransferCommand) -> Result<()> {
         match command {
-            TransferCommand::SendFile(path) => self.send_file_offer(path).await,
             TransferCommand::AcceptFile {
                 transfer_id,
                 save_path,
@@ -536,19 +608,6 @@ impl TransferRuntime {
             } => self.mark_cancelled(&transfer_id, reason).await,
             _ => Ok(()),
         }
-    }
-
-    async fn send_file_offer(&mut self, path: PathBuf) -> Result<()> {
-        let metadata = metadata_for_path(&path).await?;
-        let mut manifest = TransferManifest::new_sender(metadata.clone(), path);
-        manifest.status = TransferStatus::Offered;
-        self.store.save(&manifest).await?;
-        self.manifests
-            .insert(metadata.transfer_id.clone(), manifest.clone());
-
-        self.emit_progress(&manifest).await;
-        self.send_envelope(SignalingEnvelope::FileOffer { metadata })
-            .await
     }
 
     async fn accept_file(&mut self, transfer_id: String, save_path: PathBuf) -> Result<()> {

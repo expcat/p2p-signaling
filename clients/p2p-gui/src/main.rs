@@ -122,6 +122,8 @@ enum ConnectionState {
     Connecting,
     Connected,
     Paired,
+    Direct,
+    DirectFailed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -611,6 +613,21 @@ impl P2pChatApp {
                     self.mark_peer_available(None);
                     self.push_system(format_connect_info("对端候选", &info));
                 }
+                SessionEvent::DirectLinkEstablished(info) => {
+                    self.state = ConnectionState::Direct;
+                    self.status = format!("直连已建立：{}", info.remote_addr);
+                    self.push_system(format!("直连已建立：{}", info.remote_addr));
+                }
+                SessionEvent::DirectLinkFailed(message) => {
+                    self.state = ConnectionState::DirectFailed;
+                    self.status = "直连建立失败".into();
+                    self.push_system(format!("直连建立失败：{message}"));
+                }
+                SessionEvent::DirectLinkLost(reason) => {
+                    self.state = ConnectionState::DirectFailed;
+                    self.status = "直连已断开".into();
+                    self.push_system(format!("直连已断开：{reason}"));
+                }
                 SessionEvent::PeerConnected => {
                     self.mark_peer_available(Some("另一客户端已加入房间。"));
                 }
@@ -1079,6 +1096,8 @@ fn status_chip(ui: &mut Ui, state: ConnectionState, text: &str) {
         ConnectionState::Connecting => ("连接中", Color32::from_rgb(212, 159, 70)),
         ConnectionState::Connected => ("已连接", Color32::from_rgb(70, 146, 190)),
         ConnectionState::Paired => ("已对接", Color32::from_rgb(75, 172, 123)),
+        ConnectionState::Direct => ("直连", Color32::from_rgb(57, 190, 112)),
+        ConnectionState::DirectFailed => ("直连失败", Color32::from_rgb(220, 94, 94)),
     };
 
     Frame::new()
@@ -1353,13 +1372,15 @@ fn is_valid_room(room: &str) -> bool {
 }
 
 fn can_send_to_room(state: ConnectionState, has_handle: bool) -> bool {
-    has_handle && matches!(state, ConnectionState::Connected | ConnectionState::Paired)
+    let _ = state;
+    let _ = has_handle;
+    false
 }
 
 fn state_after_connected_event(state: ConnectionState) -> ConnectionState {
     match state {
         ConnectionState::Connecting => ConnectionState::Connected,
-        ConnectionState::Paired => ConnectionState::Paired,
+        ConnectionState::Paired | ConnectionState::Direct | ConnectionState::DirectFailed => state,
         ConnectionState::Connected | ConnectionState::Idle => state,
     }
 }
@@ -1491,8 +1512,9 @@ mod tests {
     fn chat_send_requires_peer_connection() {
         assert!(!can_send_to_room(ConnectionState::Idle, false));
         assert!(!can_send_to_room(ConnectionState::Connecting, true));
-        assert!(can_send_to_room(ConnectionState::Connected, true));
-        assert!(can_send_to_room(ConnectionState::Paired, true));
+        assert!(!can_send_to_room(ConnectionState::Connected, true));
+        assert!(!can_send_to_room(ConnectionState::Paired, true));
+        assert!(!can_send_to_room(ConnectionState::Direct, true));
         assert!(!can_send_to_room(ConnectionState::Paired, false));
     }
 
@@ -1505,6 +1527,10 @@ mod tests {
         assert_eq!(
             state_after_connected_event(ConnectionState::Paired),
             ConnectionState::Paired
+        );
+        assert_eq!(
+            state_after_connected_event(ConnectionState::Direct),
+            ConnectionState::Direct
         );
     }
 

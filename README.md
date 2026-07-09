@@ -56,9 +56,9 @@
 | `error` | 服务器 → 客户端 | `message` | 协议错误 |
 | `hello` | 客户端 → 服务器 | `role`, `roomCode?` | 兼容保留（角色已改由连接 URL 的 query 参数携带） |
 | `signal` | 客户端 ↔ 客户端（盲中继） | `payload` | **直连协商载体**，见下文 `ConnectInfo` |
-| `chat` | 客户端 ↔ 客户端（盲中继） | `text` | 聊天消息（直连建立前的过渡期 / Phase 4 后移至 QUIC） |
-| `file-offer` / `file-accept` / `file-reject` / `file-resume` / `file-chunk` / `file-ack` / `file-complete` / `file-cancel` | 客户端 ↔ 客户端（盲中继） | 见 `transfer.rs` | 文件传输（Phase 5 迁移至 QUIC 后退役） |
 | `bye` | 客户端 → 服务器 | — | 主动离房 |
+
+Worker 只接受 `hello` / `signal` / `bye`。聊天与文件帧不再允许经 Worker 中继：聊天等待 Phase 4 接入 QUIC 控制流，文件等待 Phase 5 接入 QUIC 数据流。
 
 ### `signal` 载荷：`ConnectInfo`（Phase 2 引入）
 
@@ -148,7 +148,7 @@ JSON 便于调试且复用 serde；长度前缀使得单个消息类型日后切
 - 分块数据走 **QUIC 单向流（uni-stream）**：每条流以小 JSON 头开始（`transferId`、分块索引范围），其后是**原始字节**——不再 base64（当前经 Worker 中继的方案有 ~33% 编码膨胀），分块可增大到 256 KiB+，背压由 QUIC 流控天然提供。
 - 控制消息（offer/accept/reject/resume/ack/complete/cancel）成为 `P2pMessage` 变体。
 - `TransferRuntime` 的清单/RangeSet/续传逻辑与传输层无关，迁移点仅是替换其消息发送 sink。
-- 迁移完成前，文件传输继续走现有 WebSocket 中继路径（当前行为，功能完整可用）。
+- 迁移完成前，文件发送入口禁用，不再回退到 WebSocket/Worker 中继路径。
 
 ## 失败策略
 
@@ -165,7 +165,7 @@ JSON 便于调试且复用 serde；长度前缀使得单个消息类型日后切
 |---|---|---|---|
 | **Phase 1** | **服务器分配房间码**：`/rooms/new` 路由 + DO claim 重试；`hostPresent` 门禁（无房主的码不可加入）；`room-ready` 携带 `roomCode`；客户端删除本地 `random_room_code`，从事件获取服务器码 | 房主看到服务器返回的码；访客加入不存在的码收到明确报错；第三客户端 409 | ✅ 已完成 |
 | **Phase 2** | **候选收集与交换**：`p2p-core/src/nat.rs` 手写最小 STUN Binding 客户端（单一消息类型，不引入 STUN 依赖）+ 本机网卡枚举；STUN 列表可配置（`P2P_STUN_SERVERS`，默认含大陆可达服务器，Google/Cloudflare 兜底，最多 3 个并发查询取应答）；`ConnectInfo` 定义与收发（替换 `session.rs` 中对 `Signal` 的丢弃） | 两端在不同网络/同一局域网下能互相打印对方候选列表 | ✅ 本次 |
-| **Phase 3** | **打洞 + QUIC 通道**：`p2p-core/src/direct.rs`——共享 UDP socket、打洞循环、quinn Endpoint（房主 accept / 访客 dial）、rcgen 自签证书 + 哈希锁定、pairing token 校验；事件 `DirectLinkEstablished / Failed / Lost`。新增依赖：`quinn`（**rustls-ring** feature，禁用 aws-lc-rs 以免 Windows 构建依赖 NASM/CMake）、`rcgen`；现有 WebSocket 的 native-tls 不变 | 同局域网与两个典型家用 NAT 之间直连成功；失败路径 10s 内干净超时报错 | 待做 |
+| **Phase 3** | **打洞 + QUIC 通道**：`p2p-core/src/direct.rs`——共享 UDP socket、打洞循环、quinn Endpoint（房主 accept / 访客 dial）、rcgen 自签证书 + 哈希锁定、pairing token 校验；事件 `DirectLinkEstablished / Failed / Lost`。新增依赖：`quinn`（**rustls-ring** feature，禁用 aws-lc-rs 以免 Windows 构建依赖 NASM/CMake）、`rcgen`；现有 WebSocket 的 native-tls 不变 | 同局域网与两个典型家用 NAT 之间直连成功；失败路径 10s 内干净超时报错 | ✅ 本次（代码完成，实网 NAT 验收待手动） |
 | **Phase 4** | **聊天走直连 + UI 状态**：`p2p-core/src/p2p_proto.rs` 帧协议、Hello/Ping/Pong/Chat；聊天发送切换到 QUIC；`ConnectionState` 增加 `Direct`（绿色「直连」徽标）与失败态；「重试直连」按钮 | 直连模式下 Worker 零聊天帧经过（可用中继计数验证）；断网观察到明确的失败提示 | 待做 |
 | **Phase 5** | **文件传输迁移 QUIC**：分块走二进制 uni-stream，控制消息并入 `P2pMessage`，中继路径退役 | 大文件传输成功且续传逻辑不回归 | 待做 |
 
@@ -229,11 +229,11 @@ scripts\start-client-windows.cmd -Server p2p-signaling.yizhe.studio -Room 1234 -
 
 Worker 通过 GitHub Actions 手动触发部署（`.github/workflows/deploy.yml`，需要 `CLOUDFLARE_ACCOUNT_ID` / `CLOUDFLARE_API_TOKEN` secrets），或本地 `cd worker && npm run deploy`。
 
-## 文件传输（当前行为）
+## 文件传输（待 Phase 5）
 
-两个客户端入房后，点击桌面客户端的「文件」发送文件。接收方选择保存位置并确认接收后，按 `32 KiB` 分块传输，逐块 SHA-256 校验，已完成范围持久化在系统本地数据目录 `p2p-signaling/transfers` 下的清单文件中。
+Worker 不再接受文件中继帧，桌面客户端的文件发送入口会在本地提示等待 Phase 5。既有 `TransferRuntime` 的清单、RangeSet、续传与校验逻辑保留，Phase 5 会把发送 sink 从 WebSocket 替换为 QUIC 控制消息 + 单向数据流。
 
-客户端断线或重启后重新加入同一房间，待完成的收发清单会重新广播，仅请求缺失分块。当前文件字节仍经 Worker 中继（base64 文本帧）；迁移到 QUIC 直连见路线图 Phase 5。Worker 不存储任何文件字节。
+历史的 WebSocket/base64 文件中继路径已停用，避免数据回落到中间服务器。
 
 ## 安全性说明
 

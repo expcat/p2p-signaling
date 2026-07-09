@@ -6,6 +6,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use base64::Engine;
 use if_addrs::{get_if_addrs, IfAddr};
+use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::net::{lookup_host, UdpSocket};
@@ -53,6 +54,17 @@ pub struct ConnectInfo {
     pub pairing_token: String,
 }
 
+pub struct PreparedConnectInfo {
+    pub info: ConnectInfo,
+    pub socket: std::net::UdpSocket,
+    pub certificate: DirectCertificate,
+}
+
+pub struct DirectCertificate {
+    pub cert_der: CertificateDer<'static>,
+    pub key_der: PrivateKeyDer<'static>,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ConnectInfoKind {
@@ -66,26 +78,49 @@ impl ConnectInfo {
 }
 
 pub async fn collect_connect_info(role: SignalingRole) -> Result<ConnectInfo> {
-    let socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
-        .await
+    Ok(prepare_connect_info(role).await?.info)
+}
+
+pub async fn prepare_connect_info(role: SignalingRole) -> Result<PreparedConnectInfo> {
+    let socket = std::net::UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
         .context("failed to bind UDP socket for candidate collection")?;
-    let local_port = socket.local_addr()?.port();
+    socket
+        .set_nonblocking(true)
+        .context("failed to configure UDP socket as nonblocking")?;
 
-    let mut candidates = local_candidates(local_port)?;
-    candidates.extend(server_reflexive_candidates(&socket).await);
+    let stun_socket = UdpSocket::from_std(
+        socket
+            .try_clone()
+            .context("failed to clone UDP socket for STUN")?,
+    )
+    .context("failed to prepare UDP socket for STUN")?;
+    let local_addr = socket.local_addr()?;
+    let local_port = local_addr.port();
+
+    let mut candidates = local_candidates(local_port, local_addr.is_ipv4())?;
+    candidates.extend(server_reflexive_candidates(&stun_socket).await);
     dedupe_candidates(&mut candidates);
+    drop(stun_socket);
 
-    Ok(ConnectInfo {
+    let certificate = generate_direct_certificate()?;
+
+    let info = ConnectInfo {
         kind: ConnectInfoKind::ConnectInfo,
         version: 1,
         role,
         candidates,
-        cert_hash: provisional_cert_hash(),
+        cert_hash: certificate_hash(&certificate.cert_der),
         pairing_token: pairing_token(),
+    };
+
+    Ok(PreparedConnectInfo {
+        info,
+        socket,
+        certificate,
     })
 }
 
-fn local_candidates(port: u16) -> Result<Vec<Candidate>> {
+fn local_candidates(port: u16, ipv4_socket: bool) -> Result<Vec<Candidate>> {
     let mut candidates = Vec::new();
     for iface in get_if_addrs().context("failed to enumerate local network interfaces")? {
         if iface.is_loopback() {
@@ -93,9 +128,10 @@ fn local_candidates(port: u16) -> Result<Vec<Candidate>> {
         }
 
         let ip = match iface.addr {
-            IfAddr::V4(addr) => IpAddr::V4(addr.ip),
-            IfAddr::V6(addr) if is_useful_ipv6(addr.ip) => IpAddr::V6(addr.ip),
+            IfAddr::V4(addr) if ipv4_socket => IpAddr::V4(addr.ip),
+            IfAddr::V6(addr) if !ipv4_socket && is_useful_ipv6(addr.ip) => IpAddr::V6(addr.ip),
             IfAddr::V6(_) => continue,
+            IfAddr::V4(_) => continue,
         };
 
         candidates.push(Candidate {
@@ -299,10 +335,17 @@ fn parse_xor_mapped_address(value: &[u8], transaction_id: &[u8; 12]) -> Option<S
     }
 }
 
-fn provisional_cert_hash() -> String {
+fn generate_direct_certificate() -> Result<DirectCertificate> {
+    let cert = rcgen::generate_simple_self_signed(vec!["p2p.local".into()])
+        .context("failed to generate direct-link certificate")?;
+    let cert_der = CertificateDer::from(cert.cert);
+    let key_der = PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()).into();
+    Ok(DirectCertificate { cert_der, key_der })
+}
+
+fn certificate_hash(cert: &CertificateDer<'_>) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(Uuid::new_v4().as_bytes());
-    hasher.update(Uuid::new_v4().as_bytes());
+    hasher.update(cert.as_ref());
     hex_lower(&hasher.finalize())
 }
 
