@@ -819,15 +819,17 @@ impl eframe::App for P2pChatApp {
                 }
             }
 
+            let chat_height = (ui.available_height() - 58.0).max(120.0);
             Frame::new()
                 .fill(Color32::from_rgb(18, 24, 33))
                 .corner_radius(CornerRadius::same(8))
                 .stroke(Stroke::new(1.0, Color32::from_rgb(39, 51, 67)))
                 .show(ui, |ui| {
-                    ui.set_min_height(ui.available_height() - 76.0);
+                    ui.set_height(chat_height);
                     ScrollArea::vertical()
                         .stick_to_bottom(true)
                         .auto_shrink([false, false])
+                        .max_height(chat_height)
                         .show(ui, |ui| {
                             ui.add_space(10.0);
                             if self.messages.is_empty() {
@@ -850,11 +852,13 @@ impl eframe::App for P2pChatApp {
                 } else {
                     "等待对方加入后可发送消息"
                 };
+                let composer_button_width = 86.0 + 76.0 + ui.spacing().item_spacing.x * 2.0;
+                let message_input_width = (ui.available_width() - composer_button_width).max(120.0);
                 let response = ui.add_enabled(
                     can_send_chat,
                     TextEdit::singleline(&mut self.message_input)
                         .hint_text(message_hint)
-                        .desired_width(f32::INFINITY),
+                        .desired_width(message_input_width),
                 );
                 let send_pressed = can_send_chat
                     && response.lost_focus()
