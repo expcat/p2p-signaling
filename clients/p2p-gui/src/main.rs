@@ -19,7 +19,6 @@ use p2p_core::{
 };
 
 const DEFAULT_SERVER: &str = "p2p-signaling.yizhe.studio";
-const DEFAULT_ROOM: &str = "";
 
 fn main() -> eframe::Result<()> {
     let initial_config =
@@ -56,7 +55,7 @@ impl ClientConfig {
     fn from_args(args: impl IntoIterator<Item = String>) -> anyhow::Result<Self> {
         let mut server =
             std::env::var("P2P_SIGNALING_SERVER").unwrap_or_else(|_| DEFAULT_SERVER.to_string());
-        let mut room = std::env::var("P2P_SIGNALING_ROOM").unwrap_or_else(|_| DEFAULT_ROOM.into());
+        let mut room = std::env::var("P2P_SIGNALING_ROOM").unwrap_or_default();
         let mut role = std::env::var("P2P_SIGNALING_ROLE").unwrap_or_else(|_| "host".into());
         let mut server_explicit = std::env::var("P2P_SIGNALING_SERVER").is_ok();
         let mut test_message = std::env::var("P2P_SIGNALING_TEST_MESSAGE").ok();
@@ -340,9 +339,9 @@ impl P2pChatApp {
                         self.push_system("正在连接信令服务，等待服务器分配房间号。");
                     }
                 }
-                if let Some(message) = self.pending_test_message.take() {
-                    self.pending_test_message = Some(message.clone());
-                    self.push_system(format!("将在直连建立后自动发送测试消息：{message}"));
+                if let Some(message) = &self.pending_test_message {
+                    let notice = format!("将在直连建立后自动发送测试消息：{message}");
+                    self.push_system(notice);
                 }
             }
             Ok(Err(error)) | Err(error) => {
@@ -690,10 +689,20 @@ impl P2pChatApp {
                 } => {
                     self.push_system(format!("文件已取消：{file_name}，{reason}"));
                 }
+                SessionEvent::SignalingClosed => {
+                    if self.state == ConnectionState::Direct {
+                        // 直连已建立时信令通道只影响重试直连，不影响聊天
+                        self.push_system("信令连接已关闭，直连聊天不受影响。");
+                    } else if self.handle.is_some() {
+                        self.handle = None;
+                        self.active_room = None;
+                        self.state = ConnectionState::Idle;
+                        self.status = "信令连接已断开".into();
+                        self.push_system("信令连接已断开，可重新创建或加入房间。");
+                    }
+                }
                 SessionEvent::Error(message) => {
-                    self.state = ConnectionState::Idle;
-                    self.handle = None;
-                    self.event_rx = None;
+                    // 错误仅提示，不拆会话：致命断开由 SignalingClosed / DirectLinkLost 负责
                     self.status = format!("错误：{message}");
                     self.push_system(format!("错误：{message}"));
                 }
@@ -866,14 +875,33 @@ impl eframe::App for P2pChatApp {
                 ui.separator();
                 ui.label(RichText::new("房间").strong());
                 ui.add_space(6.0);
+                let room_label = self.room_label().to_string();
+                let active_room = self
+                    .active_room
+                    .clone()
+                    .filter(|room| !room.is_empty());
+                let mut copied_room = None;
+                let mut disconnect_clicked = false;
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(self.room_label()).font(FontId::monospace(32.0)));
+                    ui.label(RichText::new(room_label).font(FontId::monospace(32.0)));
+                    if let Some(room) = active_room {
+                        if ui.small_button("复制").clicked() {
+                            ui.ctx().copy_text(room.clone());
+                            copied_room = Some(room);
+                        }
+                    }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if self.handle.is_some() && ui.button("断开").clicked() {
-                            self.disconnect();
+                            disconnect_clicked = true;
                         }
                     });
                 });
+                if let Some(room) = copied_room {
+                    self.status = format!("已复制房间号 {room}");
+                }
+                if disconnect_clicked {
+                    self.disconnect();
+                }
                 ui.add_space(8.0);
 
                 let can_connect = !self.server.trim().is_empty();
@@ -1427,8 +1455,7 @@ fn can_send_to_room(state: ConnectionState, has_handle: bool) -> bool {
 fn state_after_connected_event(state: ConnectionState) -> ConnectionState {
     match state {
         ConnectionState::Connecting => ConnectionState::Connected,
-        ConnectionState::Paired | ConnectionState::Direct | ConnectionState::DirectFailed => state,
-        ConnectionState::Connected | ConnectionState::Idle => state,
+        _ => state,
     }
 }
 

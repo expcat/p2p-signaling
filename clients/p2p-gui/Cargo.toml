@@ -8,7 +8,7 @@ anyhow = "1"
 dirs = "5"
 eframe = { version = "0.35", default-features = false, features = ["default_fonts", "glow"] }
 p2p-core = { path = "../p2p-core" }
-rfd = "0.17.2"
+rfd = { version = "0.17.2", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["net", "rt", "sync", "time"] }

@@ -10,7 +10,6 @@ use quinn::rustls::client::danger::{
 };
 use quinn::rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use quinn::rustls::{self, CertificateError, DigitallySignedStruct, SignatureScheme};
-use sha2::{Digest, Sha256};
 use tokio::time::timeout;
 
 use crate::nat::{Candidate, CandidateKind, PreparedConnectInfo};
@@ -235,8 +234,7 @@ async fn verify_guest_control(
 ) -> Result<(quinn::SendStream, quinn::RecvStream)> {
     let (mut send, mut recv) = connection.open_bi().await?;
     write_hello(&mut send, local_token).await?;
-    let hello = read_hello(&mut recv).await?;
-    ensure_token(&hello, peer_token)?;
+    read_and_check_hello(&mut recv, peer_token).await?;
     Ok((send, recv))
 }
 
@@ -246,8 +244,7 @@ async fn verify_host_control(
     peer_token: &str,
 ) -> Result<(quinn::SendStream, quinn::RecvStream)> {
     let (mut send, mut recv) = connection.accept_bi().await?;
-    let hello = read_hello(&mut recv).await?;
-    ensure_token(&hello, peer_token)?;
+    read_and_check_hello(&mut recv, peer_token).await?;
     write_hello(&mut send, local_token).await?;
     Ok((send, recv))
 }
@@ -262,22 +259,11 @@ async fn write_hello(send: &mut quinn::SendStream, token: &str) -> Result<()> {
     .await
 }
 
-async fn read_hello(recv: &mut quinn::RecvStream) -> Result<DirectControl> {
+async fn read_and_check_hello(recv: &mut quinn::RecvStream, expected_token: &str) -> Result<()> {
     match read_p2p_message(recv).await? {
-        P2pMessage::Hello { token } => Ok(DirectControl::Hello { token }),
+        P2pMessage::Hello { token } if token == expected_token => Ok(()),
+        P2pMessage::Hello { .. } => anyhow::bail!("直连配对令牌不匹配"),
         message => anyhow::bail!("直连首帧不是 Hello：{message:?}"),
-    }
-}
-
-#[derive(Debug)]
-enum DirectControl {
-    Hello { token: String },
-}
-
-fn ensure_token(hello: &DirectControl, expected: &str) -> Result<()> {
-    match hello {
-        DirectControl::Hello { token } if token == expected => Ok(()),
-        DirectControl::Hello { .. } => anyhow::bail!("直连配对令牌不匹配"),
     }
 }
 
@@ -337,7 +323,7 @@ impl ServerCertVerifier for CertHashVerifier {
         _ocsp: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        let actual = hex_lower(&Sha256::digest(end_entity.as_ref()));
+        let actual = crate::transfer::sha256_hex(end_entity.as_ref());
         if actual == self.expected_hash {
             Ok(ServerCertVerified::assertion())
         } else {
@@ -382,12 +368,3 @@ impl ServerCertVerifier for CertHashVerifier {
     }
 }
 
-fn hex_lower(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(HEX[(byte >> 4) as usize] as char);
-        output.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    output
-}

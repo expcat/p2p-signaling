@@ -42,6 +42,8 @@ pub struct FileTransferProgress {
 #[derive(Debug)]
 pub enum SessionEvent {
     Connected,
+    /// 信令 WebSocket 已关闭；若直连已建立则聊天不受影响，仅无法重试直连
+    SignalingClosed,
     /// 服务器在 room-ready 中下发的权威房间码
     RoomCodeAssigned(String),
     LocalCandidatesCollected(ConnectInfo),
@@ -175,22 +177,21 @@ impl ChatSession {
             loop {
                 tokio::select! {
                     command = session_rx.recv() => {
-                        match command {
-                            Some(SessionCommand::RetryDirect) => {
-                                connect_info_sent = false;
-                                local_direct = None;
-                                peer_direct = None;
-                                direct_started = false;
-                                announce_connect_info_once(
-                                    &mut connect_info_sent,
-                                    signaling_role.clone(),
-                                    dispatch_signaling_tx.clone(),
-                                    dispatch_events.clone(),
-                                    direct_ready_tx.clone(),
-                                );
-                            }
-                            None => {}
-                        }
+                        // 命令通道关闭说明会话句柄已被丢弃，结束分发循环
+                        let Some(SessionCommand::RetryDirect) = command else {
+                            break;
+                        };
+                        connect_info_sent = false;
+                        local_direct = None;
+                        peer_direct = None;
+                        direct_started = false;
+                        announce_connect_info_once(
+                            &mut connect_info_sent,
+                            signaling_role.clone(),
+                            dispatch_signaling_tx.clone(),
+                            dispatch_events.clone(),
+                            direct_ready_tx.clone(),
+                        );
                     }
                     prepared = direct_ready_rx.recv() => {
                         let Some(prepared) = prepared else {
@@ -301,6 +302,8 @@ impl ChatSession {
                     }
                 }
             }
+
+            let _ = dispatch_events.send(SessionEvent::SignalingClosed).await;
         });
 
         let hello = match self.role {

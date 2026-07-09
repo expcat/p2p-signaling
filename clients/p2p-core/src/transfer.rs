@@ -24,10 +24,6 @@ impl ChunkRange {
     pub fn is_empty(&self) -> bool {
         self.start >= self.end
     }
-
-    pub fn contains(&self, index: u64) -> bool {
-        self.start <= index && index < self.end
-    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -50,10 +46,6 @@ impl RangeSet {
 
     pub fn into_ranges(self) -> Vec<ChunkRange> {
         self.ranges
-    }
-
-    pub fn contains(&self, index: u64) -> bool {
-        self.ranges.iter().any(|range| range.contains(index))
     }
 
     pub fn insert(&mut self, index: u64) {
@@ -203,11 +195,6 @@ impl TransferManifest {
         RangeSet::from_ranges(self.completed_chunks.clone())
     }
 
-    pub fn missing_ranges(&self) -> Vec<ChunkRange> {
-        self.completed_set()
-            .missing_ranges(self.metadata.total_chunks)
-    }
-
     pub fn completed_bytes(&self) -> u64 {
         self.metadata
             .bytes_for_chunks(self.completed_set().completed_chunks())
@@ -245,10 +232,6 @@ impl TransferStore {
         Self { root }
     }
 
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
-
     pub async fn save(&self, manifest: &TransferManifest) -> Result<()> {
         tokio::fs::create_dir_all(&self.root).await?;
         let path = self.manifest_path(&manifest.metadata.transfer_id);
@@ -264,34 +247,6 @@ impl TransferStore {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error.into()),
         }
-    }
-
-    pub async fn load_pending(&self) -> Result<Vec<TransferManifest>> {
-        let mut manifests = Vec::new();
-        let Ok(mut entries) = tokio::fs::read_dir(&self.root).await else {
-            return Ok(manifests);
-        };
-
-        while let Some(entry) = entries.next_entry().await? {
-            if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
-                continue;
-            }
-
-            let Ok(text) = tokio::fs::read_to_string(entry.path()).await else {
-                continue;
-            };
-            let Ok(manifest) = serde_json::from_str::<TransferManifest>(&text) else {
-                continue;
-            };
-            if !matches!(
-                manifest.status,
-                TransferStatus::Complete | TransferStatus::Cancelled
-            ) {
-                manifests.push(manifest);
-            }
-        }
-
-        Ok(manifests)
     }
 
     fn manifest_path(&self, transfer_id: &str) -> PathBuf {
@@ -337,11 +292,6 @@ pub async fn metadata_for_path(path: &Path) -> Result<FileMetadata> {
     })
 }
 
-pub async fn read_chunk(path: &Path, index: u64, chunk_size: u64) -> Result<RawChunk> {
-    let mut file = open_chunk_source(path).await?;
-    read_chunk_from(&mut file, index, chunk_size).await
-}
-
 pub async fn open_chunk_source(path: &Path) -> Result<tokio::fs::File> {
     tokio::fs::File::open(path)
         .await
@@ -382,13 +332,6 @@ pub async fn open_chunk_sink(path: &Path) -> Result<tokio::fs::File> {
     let mut options = tokio::fs::OpenOptions::new();
     options.create(true).write(true).read(true);
     Ok(options.open(path).await?)
-}
-
-pub async fn write_chunk(path: &Path, chunk: &RawChunk, chunk_size: u64) -> Result<()> {
-    let mut file = open_chunk_sink(path).await?;
-    write_chunk_to(&mut file, chunk, chunk_size).await?;
-    file.flush().await?;
-    Ok(())
 }
 
 pub async fn write_chunk_to(
@@ -582,36 +525,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_pending_skips_unreadable_or_corrupt_manifests() {
-        let root = std::env::temp_dir().join(format!("p2p-pending-test-{}", Uuid::new_v4()));
-        tokio::fs::create_dir_all(&root).await.unwrap();
-        let store = TransferStore::new(root.clone());
-        let manifest = TransferManifest::new_sender(
-            FileMetadata {
-                transfer_id: "file-valid".into(),
-                file_name: "a.bin".into(),
-                file_size: 3,
-                chunk_size: DEFAULT_CHUNK_SIZE,
-                total_chunks: 1,
-                modified_millis: Some(1),
-                sample_hash: "sample".into(),
-                file_hash: "hash".into(),
-            },
-            PathBuf::from("/tmp/a.bin"),
-        );
-
-        store.save(&manifest).await.unwrap();
-        tokio::fs::write(root.join("broken.json"), b"{not valid json")
-            .await
-            .unwrap();
-
-        let pending = store.load_pending().await.unwrap();
-
-        assert_eq!(pending, vec![manifest]);
-        tokio::fs::remove_dir_all(root).await.unwrap();
-    }
-
-    #[tokio::test]
     async fn metadata_transfer_id_is_stable_for_same_file() {
         let root = std::env::temp_dir().join(format!("p2p-metadata-test-{}", Uuid::new_v4()));
         tokio::fs::create_dir_all(&root).await.unwrap();
@@ -672,7 +585,10 @@ mod tests {
         assert_eq!(metadata.file_size, 0);
 
         let manifest = TransferManifest::new_receiver(metadata, root.join("saved.bin"));
-        assert!(manifest.missing_ranges().is_empty());
+        assert!(manifest
+            .completed_set()
+            .missing_ranges(manifest.metadata.total_chunks)
+            .is_empty());
         assert!(manifest.is_complete());
 
         tokio::fs::remove_dir_all(root).await.unwrap();
@@ -690,13 +606,16 @@ mod tests {
             .collect::<Vec<_>>();
         tokio::fs::write(&source, &bytes).await.unwrap();
 
-        let second = read_chunk(&source, 1, chunk_size).await.unwrap();
-        let first = read_chunk(&source, 0, chunk_size).await.unwrap();
-        let third = read_chunk(&source, 2, chunk_size).await.unwrap();
+        let mut reader = open_chunk_source(&source).await.unwrap();
+        let second = read_chunk_from(&mut reader, 1, chunk_size).await.unwrap();
+        let first = read_chunk_from(&mut reader, 0, chunk_size).await.unwrap();
+        let third = read_chunk_from(&mut reader, 2, chunk_size).await.unwrap();
 
+        let mut sink = open_chunk_sink(&output).await.unwrap();
         for chunk in [second, first, third] {
-            write_chunk(&output, &chunk, chunk_size).await.unwrap();
+            write_chunk_to(&mut sink, &chunk, chunk_size).await.unwrap();
         }
+        sink.flush().await.unwrap();
 
         assert_eq!(
             hash_file(&source).await.unwrap(),

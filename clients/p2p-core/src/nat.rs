@@ -8,7 +8,6 @@ use base64::Engine;
 use if_addrs::{get_if_addrs, IfAddr};
 use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use tokio::net::{lookup_host, UdpSocket};
 use tokio::time::{timeout, Instant};
 use uuid::Uuid;
@@ -75,10 +74,6 @@ impl ConnectInfo {
     pub fn is_supported(&self) -> bool {
         self.kind == ConnectInfoKind::ConnectInfo && self.version == 1
     }
-}
-
-pub async fn collect_connect_info(role: SignalingRole) -> Result<ConnectInfo> {
-    Ok(prepare_connect_info(role).await?.info)
 }
 
 pub async fn prepare_connect_info(role: SignalingRole) -> Result<PreparedConnectInfo> {
@@ -344,9 +339,7 @@ fn generate_direct_certificate() -> Result<DirectCertificate> {
 }
 
 fn certificate_hash(cert: &CertificateDer<'_>) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(cert.as_ref());
-    hex_lower(&hasher.finalize())
+    crate::transfer::sha256_hex(cert.as_ref())
 }
 
 fn pairing_token() -> String {
@@ -354,16 +347,6 @@ fn pairing_token() -> String {
     bytes[..16].copy_from_slice(Uuid::new_v4().as_bytes());
     bytes[16..].copy_from_slice(Uuid::new_v4().as_bytes());
     base64::engine::general_purpose::STANDARD.encode(bytes)
-}
-
-fn hex_lower(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(HEX[(byte >> 4) as usize] as char);
-        output.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    output
 }
 
 #[cfg(test)]
