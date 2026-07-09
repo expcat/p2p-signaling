@@ -1,6 +1,6 @@
 # p2p-signaling
 
-一对一 P2P 数据传输工具：两台内网客户端通过信令服务器以 **4 位房间码**配对，随后进行 NAT 打洞建立**点对点直连通道**，聊天消息（以及后续的文件传输）不再经过任何中间服务器。服务器只负责信令（配对与连接元数据交换），不承载业务数据。
+一对一 P2P 数据传输工具：两台内网客户端通过信令服务器以 **4 位房间码**配对，随后进行 NAT 打洞建立**点对点直连通道**，聊天消息和文件传输不再经过任何中间服务器。服务器只负责信令（配对与连接元数据交换），不承载业务数据。
 
 ## 目录结构
 
@@ -20,7 +20,7 @@
 │            │◀════════════════════════════════════▶└──────────▲───────────┘
 └─────┬──────┘                                                 │ ② WS 连接 /rooms/1234（访客）
       │ ④ UDP 打洞 → QUIC 直连（quinn，证书哈希锁定）       ┌─────┴──────┐
-      └══════════ 聊天 /（后续）文件传输，点对点直传 ═══════│  客户端 B   │
+      └══════════ 聊天 / 文件传输，点对点直传 ═════════════│  客户端 B   │
                         ▲                                └────────────┘
                ┌────────┴────────┐
                │  公共 STUN 服务  │ （Worker 跑在 Cloudflare 边缘，无法收发 UDP，
@@ -32,7 +32,7 @@
 | 路径 | 承载内容 | 生命周期 |
 |---|---|---|
 | **信令 WebSocket**（客户端 ↔ Worker） | 房间配对、连接元数据（候选地址/证书哈希/配对令牌）、直连建立前的房间事件 | 直连建立后仅保留信令用途（重协商、房间生命周期） |
-| **直连 QUIC**（客户端 ↔ 客户端） | 聊天消息、（后续）文件分块 | 打洞成功后建立；断开即会话结束（见「失败策略」） |
+| **直连 QUIC**（客户端 ↔ 客户端） | 聊天消息、文件控制消息、文件分块 | 打洞成功后建立；断开即会话结束（见「失败策略」） |
 
 ## 房间与信令协议
 
@@ -60,7 +60,7 @@
 
 Worker 只接受 `hello` / `signal` / `bye`。聊天与文件帧不再允许经 Worker 中继：聊天与文件控制消息走 QUIC 控制流，文件分块数据走 QUIC 单向数据流。
 
-### `signal` 载荷：`ConnectInfo`（Phase 2 引入）
+### `signal` 载荷：`ConnectInfo`
 
 直连协商复用现有 `signal` envelope（Worker 盲中继，**零服务端改动**），内层 payload 为带 `kind` 标签的 JSON：
 
@@ -112,8 +112,8 @@ sequenceDiagram
         B-->>A: UDP 探测
     end
     B->>A: QUIC 握手（dial，优先局域网候选；证书哈希锁定）
-    A->>B: P2pHello { pairingToken }
-    B->>A: P2pHello { pairingToken }
+    A->>B: P2pMessage::Hello { token }
+    B->>A: P2pMessage::Hello { token }
     Note over A,B: 双方各自「已发送且已收到」合法 Hello → 直连已建立
 ```
 
@@ -122,12 +122,12 @@ sequenceDiagram
 - **单 UDP socket**：STUN 探测、打洞、QUIC 共用同一个本地 socket，保证 NAT 映射一致。
 - **候选优先级**：访客 dial 时先试 `local` 候选（同一局域网内瞬时可达，无需打洞），再试反射地址；IPv6 全局地址若两端都有则往往无需打洞。
 - **证书信任模型**：两端各自用 `rcgen` 生成自签证书，把 DER 的 SHA-256 经信令通道交换；QUIC 客户端安装自定义 `ServerCertVerifier` 锁定该哈希（与 WebRTC 的 DTLS fingerprint 同一模型），无 CA、无域名。
-- **双方确认（缺一不可）**：① QUIC 握手成功且证书哈希匹配；② 控制流上双向交换 `P2pHello { pairingToken }` 且令牌与信令阶段交换值一致。两个条件都满足才触发 `DirectLinkEstablished`，UI 置为「直连已建立」，之后双方才可发送消息。
+- **双方确认（缺一不可）**：① QUIC 握手成功且证书哈希匹配；② 控制流上双向交换 `P2pMessage::Hello { token }` 且令牌与信令阶段交换值一致。两个条件都满足才触发 `DirectLinkEstablished`，UI 置为「直连已建立」，之后双方才可发送消息。
 - **保活与断线检测**：quinn `keep_alive_interval ≈ 10s`、`max_idle_timeout ≈ 30s`；超时视为链路断开。
 
 ## 直连数据协议
 
-### 控制流（Phase 4）
+### 控制流
 
 一条长期存活的 QUIC 双向流，帧格式：`u32 小端长度前缀 + serde JSON`。
 
@@ -137,13 +137,19 @@ enum P2pMessage {
     Ping,
     Pong,
     Chat { text: String },
-    // 后续：文件传输控制消息（offer/accept/ack/resume/cancel）
+    FileOffer { metadata: FileMetadata },
+    FileAccept { transfer_id: String, completed_chunks: Vec<ChunkRange> },
+    FileReject { transfer_id: String, reason: String },
+    FileResume { transfer_id: String, completed_chunks: Vec<ChunkRange> },
+    FileAck { transfer_id: String, chunks: Vec<ChunkRange> },
+    FileComplete { transfer_id: String },
+    FileCancel { transfer_id: String, reason: String },
 }
 ```
 
 JSON 便于调试且复用 serde；长度前缀使得单个消息类型日后切换二进制编码时框架层无需变更。
 
-### 文件传输（Phase 5）
+### 文件传输
 
 - 分块数据走 **QUIC 单向流（uni-stream）**：每条流以小 JSON 头开始（`transferId`、分块索引范围），其后是**原始字节**，不再 base64；默认分块为 256 KiB，背压由 QUIC 流控提供。
 - 控制消息（offer/accept/reject/resume/ack/complete/cancel）是 `P2pMessage` 变体，和聊天复用同一条 QUIC 控制流。
@@ -164,10 +170,10 @@ JSON 便于调试且复用 serde；长度前缀使得单个消息类型日后切
 | 阶段 | 内容 | 验收标准 | 状态 |
 |---|---|---|---|
 | **Phase 1** | **服务器分配房间码**：`/rooms/new` 路由 + DO claim 重试；`hostPresent` 门禁（无房主的码不可加入）；`room-ready` 携带 `roomCode`；客户端删除本地 `random_room_code`，从事件获取服务器码 | 房主看到服务器返回的码；访客加入不存在的码收到明确报错；第三客户端 409 | ✅ 已完成 |
-| **Phase 2** | **候选收集与交换**：`p2p-core/src/nat.rs` 手写最小 STUN Binding 客户端（单一消息类型，不引入 STUN 依赖）+ 本机网卡枚举；STUN 列表可配置（`P2P_STUN_SERVERS`，默认含大陆可达服务器，Google/Cloudflare 兜底，最多 3 个并发查询取应答）；`ConnectInfo` 定义与收发（替换 `session.rs` 中对 `Signal` 的丢弃） | 两端在不同网络/同一局域网下能互相打印对方候选列表 | ✅ 本次 |
-| **Phase 3** | **打洞 + QUIC 通道**：`p2p-core/src/direct.rs`——共享 UDP socket、打洞循环、quinn Endpoint（房主 accept / 访客 dial）、rcgen 自签证书 + 哈希锁定、pairing token 校验；事件 `DirectLinkEstablished / Failed / Lost`。新增依赖：`quinn`（**rustls-ring** feature，禁用 aws-lc-rs 以免 Windows 构建依赖 NASM/CMake）、`rcgen`；现有 WebSocket 的 native-tls 不变 | 同局域网与两个典型家用 NAT 之间直连成功；失败路径 10s 内干净超时报错 | ✅ 本次（代码完成，实网 NAT 验收待手动） |
-| **Phase 4** | **聊天走直连 + UI 状态**：`p2p-core/src/p2p_proto.rs` 帧协议、Hello/Ping/Pong/Chat；聊天发送切换到 QUIC；`ConnectionState` 增加 `Direct`（绿色「直连」徽标）与失败态；「重试直连」按钮；Rust 信令 envelope 删除旧 Chat/File 中继帧 | 直连模式下 Worker 零聊天帧经过（Worker 只接受 `hello` / `signal` / `bye`）；断网观察到明确的失败提示 | ✅ 本次 |
-| **Phase 5** | **文件传输迁移 QUIC**：分块走二进制 uni-stream，控制消息并入 `P2pMessage`，中继路径退役 | 大文件传输成功且续传逻辑不回归 | ✅ 本次（代码完成，实机大文件/断点续传待手动验收） |
+| **Phase 2** | **候选收集与交换**：`p2p-core/src/nat.rs` 手写最小 STUN Binding 客户端（单一消息类型，不引入 STUN 依赖）+ 本机网卡枚举；STUN 列表可配置（`P2P_STUN_SERVERS`，默认含大陆可达服务器，Google/Cloudflare 兜底，最多 3 个并发查询取应答）；`ConnectInfo` 定义与收发（替换 `session.rs` 中对 `Signal` 的丢弃） | 两端在不同网络/同一局域网下能互相打印对方候选列表 | ✅ 已完成 |
+| **Phase 3** | **打洞 + QUIC 通道**：`p2p-core/src/direct.rs`——共享 UDP socket、打洞循环、quinn Endpoint（房主 accept / 访客 dial）、rcgen 自签证书 + 哈希锁定、pairing token 校验；事件 `DirectLinkEstablished / Failed / Lost`。新增依赖：`quinn`（**rustls-ring** feature，禁用 aws-lc-rs 以免 Windows 构建依赖 NASM/CMake）、`rcgen`；现有 WebSocket 的 native-tls 不变 | 同局域网与两个典型家用 NAT 之间直连成功；失败路径 10s 内干净超时报错 | ✅ 代码完成；实网 NAT 验收待手动 |
+| **Phase 4** | **聊天走直连 + UI 状态**：`p2p-core/src/p2p_proto.rs` 帧协议、Hello/Ping/Pong/Chat；聊天发送切换到 QUIC；`ConnectionState` 增加 `Direct`（绿色「直连」徽标）与失败态；「重试直连」按钮；Rust 信令 envelope 删除旧 Chat/File 中继帧 | 直连模式下 Worker 零聊天帧经过（Worker 只接受 `hello` / `signal` / `bye`）；断网观察到明确的失败提示 | ✅ 已完成 |
+| **Phase 5** | **文件传输迁移 QUIC**：分块走二进制 uni-stream，控制消息并入 `P2pMessage`，中继路径退役 | 大文件传输成功且续传逻辑不回归 | ✅ 代码完成；实机大文件/断点续传待手动验收 |
 
 ## 本地开发与构建
 
@@ -223,7 +229,7 @@ scripts\start-client-windows.cmd -Server p2p-signaling.yizhe.studio -Room 1234 -
 - `P2P_SIGNALING_SERVER`：信令服务器地址（裸域名走 `wss://`；`localhost`/`127.*` 自动走 `ws://`）。
 - `P2P_SIGNALING_ROOM`：4 位房间码，**仅访客需要**（房主的码由服务器分配，此变量被忽略）。
 - `P2P_SIGNALING_ROLE`：`host` / `guest`。
-- `P2P_STUN_SERVERS`：（Phase 2 起）逗号分隔的 STUN 服务器列表，覆盖默认值。
+- `P2P_STUN_SERVERS`：逗号分隔的 STUN 服务器列表，覆盖默认值。
 
 ### 部署
 

@@ -95,10 +95,7 @@ export class RoomObject {
   private sessions = new Map<WebSocket, ClientRole>();
   private hostPresent = false;
 
-  constructor(private readonly state: DurableObjectState, private readonly env: Env) {
-    void this.state;
-    void this.env;
-  }
+  constructor(_state: DurableObjectState, _env: Env) {}
 
   async fetch(request: Request): Promise<Response> {
     if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
