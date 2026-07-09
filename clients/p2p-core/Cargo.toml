@@ -17,8 +17,3 @@ sha2 = "0.10"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "rt", "sync", "time"] }
 tokio-tungstenite = { version = "0.21", default-features = false, features = ["connect", "native-tls"] }
 uuid = { version = "1", features = ["v4"] }
-webrtc = { version = "0.8", optional = true }
-
-[features]
-default = []
-direct-webrtc = ["dep:webrtc"]
