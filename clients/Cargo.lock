@@ -1824,7 +1824,6 @@ dependencies = [
  "anyhow",
  "dirs",
  "eframe",
- "getrandom 0.2.17",
  "p2p-core",
  "rfd",
  "serde",

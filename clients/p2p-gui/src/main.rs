@@ -8,8 +8,7 @@ use eframe::egui::{
     Frame, Layout, RichText, ScrollArea, Stroke, TextEdit, Ui, Vec2,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::runtime::{Builder, Handle};
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio::sync::oneshot;
@@ -241,29 +240,31 @@ impl P2pChatApp {
             config_path,
         };
 
-        if is_valid_room(&initial_room) {
-            let role = match initial_role {
-                RoleChoice::Host => SessionRole::Host {
-                    room_code: initial_room,
-                },
-                RoleChoice::Guest => SessionRole::Guest {
-                    room_code: initial_room,
-                },
-            };
-            app.start_session(role);
-        } else if initial_role == RoleChoice::Guest {
-            app.status = "已填入房间号，可直接加入".into();
+        match initial_role {
+            RoleChoice::Host => {
+                // 房间码由服务器分配；提供了 --room 视为希望自动开房，但码本身被忽略
+                if !initial_room.is_empty() {
+                    app.push_system("房间号由服务器分配，已忽略 --room/P2P_SIGNALING_ROOM。");
+                    app.room_input.clear();
+                    app.start_session(SessionRole::Host);
+                }
+            }
+            RoleChoice::Guest => {
+                if is_valid_room(&initial_room) {
+                    app.start_session(SessionRole::Guest {
+                        room_code: initial_room,
+                    });
+                } else {
+                    app.status = "已填入房间号，可直接加入".into();
+                }
+            }
         }
 
         app
     }
 
     fn create_room(&mut self) {
-        let room = random_room_code();
-        self.room_input = room.clone();
-        self.start_session(SessionRole::Host {
-            room_code: room.clone(),
-        });
+        self.start_session(SessionRole::Host);
     }
 
     fn join_room(&mut self) {
@@ -280,16 +281,16 @@ impl P2pChatApp {
     }
 
     fn start_session(&mut self, role: SessionRole) {
-        let action = if matches!(role, SessionRole::Host { .. }) {
-            "已创建"
-        } else {
-            "正在加入"
-        };
         let room = match &role {
-            SessionRole::Host { room_code } | SessionRole::Guest { room_code } => room_code.clone(),
+            SessionRole::Host => None,
+            SessionRole::Guest { room_code } => Some(room_code.clone()),
         };
 
-        let signaling_url = match build_signaling_url(&self.server, &room) {
+        let signaling_url = match &room {
+            None => build_host_signaling_url(&self.server),
+            Some(room) => build_signaling_url(&self.server, room),
+        };
+        let signaling_url = match signaling_url {
             Ok(url) => url,
             Err(error) => {
                 self.status = format!("{error:#}");
@@ -321,13 +322,21 @@ impl P2pChatApp {
                 let test_handle = handle.clone();
                 self.handle = Some(handle);
                 self.event_rx = Some(ui_event_rx);
-                self.active_room = Some(room.clone());
+                self.active_room = room.clone();
                 self.messages.clear();
                 self.pending_offers.clear();
                 self.transfers.clear();
                 self.state = ConnectionState::Connecting;
-                self.status = format!("正在连接房间 {room}");
-                self.push_system(format!("房间 {room} {action}，正在连接信令服务。"));
+                match &room {
+                    Some(room) => {
+                        self.status = format!("正在加入房间 {room}");
+                        self.push_system(format!("正在加入房间 {room}，连接信令服务中。"));
+                    }
+                    None => {
+                        self.status = "正在创建房间".into();
+                        self.push_system("正在连接信令服务，等待服务器分配房间号。");
+                    }
+                }
                 if let Some(message) = self.pending_test_message.take() {
                     self.push_system(format!("将在连接后自动发送测试消息：{message}"));
                     let notifier = self.notifier.clone();
@@ -586,7 +595,10 @@ impl P2pChatApp {
                         self.push_system("已连接信令服务。");
                     }
                 }
-                SessionEvent::RoomCodeGenerated(room) => {
+                SessionEvent::RoomCodeAssigned(room) => {
+                    if self.active_room.as_deref() != Some(room.as_str()) {
+                        self.push_system(format!("服务器已分配房间号：{room}"));
+                    }
                     self.active_room = Some(room);
                 }
                 SessionEvent::PeerConnected => {
@@ -827,7 +839,7 @@ impl eframe::App for P2pChatApp {
                 ui.add_space(8.0);
 
                 let can_connect = !self.server.trim().is_empty();
-                if full_width_button(ui, can_connect, "创建 4 位随机房间", 36.0).clicked() {
+                if full_width_button(ui, can_connect, "创建房间", 36.0).clicked() {
                     self.create_room();
                 }
 
@@ -1284,22 +1296,6 @@ fn require_value(flag: &str, value: Option<String>) -> anyhow::Result<String> {
         .ok_or_else(|| anyhow::anyhow!("{flag} requires a value"))
 }
 
-fn random_room_code() -> String {
-    static ROOM_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    let mut bytes = [0_u8; 2];
-    if getrandom::getrandom(&mut bytes).is_ok() {
-        return format!("{:04}", u16::from_ne_bytes(bytes) % 10_000);
-    }
-
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos() as u64);
-    let sequence = ROOM_COUNTER.fetch_add(1, Ordering::Relaxed);
-
-    format!("{:04}", now.wrapping_add(sequence) % 10_000)
-}
-
 fn normalize_room_input(value: &str) -> String {
     value
         .chars()
@@ -1344,29 +1340,40 @@ fn state_after_peer_activity(state: ConnectionState, has_handle: bool) -> Connec
     }
 }
 
-fn build_signaling_url(server: &str, room: &str) -> anyhow::Result<String> {
+fn signaling_base(server: &str) -> anyhow::Result<String> {
     let server = server.trim().trim_end_matches('/');
-    let room = room.trim().trim_matches('/');
 
     if server.is_empty() {
         anyhow::bail!("信令服务器地址不能为空");
     }
+
+    let base = if server.starts_with("wss://") || server.starts_with("ws://") {
+        server.to_string()
+    } else if let Some(host) = server.strip_prefix("https://") {
+        format!("wss://{host}")
+    } else if let Some(host) = server.strip_prefix("http://") {
+        format!("ws://{host}")
+    } else {
+        let scheme = if is_local_server(server) { "ws" } else { "wss" };
+        format!("{scheme}://{server}")
+    };
+
+    Ok(base)
+}
+
+fn build_signaling_url(server: &str, room: &str) -> anyhow::Result<String> {
+    let room = room.trim().trim_matches('/');
+
     if !is_valid_room(room) {
         anyhow::bail!("房间号需要 4 位数字");
     }
 
-    let url = if server.starts_with("wss://") || server.starts_with("ws://") {
-        append_room_path(server, room)
-    } else if let Some(host) = server.strip_prefix("https://") {
-        append_room_path(&format!("wss://{host}"), room)
-    } else if let Some(host) = server.strip_prefix("http://") {
-        append_room_path(&format!("ws://{host}"), room)
-    } else {
-        let scheme = if is_local_server(server) { "ws" } else { "wss" };
-        append_room_path(&format!("{scheme}://{server}"), room)
-    };
+    Ok(append_room_path(&signaling_base(server)?, room))
+}
 
-    Ok(url)
+/// 房主连接 /rooms/new，由服务器分配房间码
+fn build_host_signaling_url(server: &str) -> anyhow::Result<String> {
+    Ok(append_room_path(&signaling_base(server)?, "new"))
 }
 
 fn append_room_path(base: &str, room: &str) -> String {
@@ -1388,6 +1395,7 @@ fn print_usage() {
     println!(
         "Usage: p2p-gui [SERVER] [--server SERVER] [--room ROOM] [--role host|guest]\n\
          \n\
+         --room is only used by guests; the host's room code is assigned by the server.\n\
          Optional test automation: --test-message TEXT\n\
          \n\
          SERVER may be a domain, IP, http(s) URL, or ws(s) URL.\n\
@@ -1421,6 +1429,18 @@ mod tests {
     fn keeps_full_websocket_room_url() {
         let url = build_signaling_url("wss://example.com/rooms/5678", "1234").unwrap();
         assert_eq!(url, "wss://example.com/rooms/5678");
+    }
+
+    #[test]
+    fn builds_host_url_without_room() {
+        let url = build_host_signaling_url("p2p-signaling.yizhe.studio").unwrap();
+        assert_eq!(url, "wss://p2p-signaling.yizhe.studio/rooms/new");
+    }
+
+    #[test]
+    fn builds_local_host_url() {
+        let url = build_host_signaling_url("127.0.0.1:8787").unwrap();
+        assert_eq!(url, "ws://127.0.0.1:8787/rooms/new");
     }
 
     #[test]

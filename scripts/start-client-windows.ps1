@@ -1,6 +1,6 @@
 param(
     [string]$Server = $(if ($env:P2P_SIGNALING_SERVER) { $env:P2P_SIGNALING_SERVER } else { "p2p-signaling.yizhe.studio" }),
-    [string]$Room = $(if ($env:P2P_SIGNALING_ROOM) { $env:P2P_SIGNALING_ROOM } else { "LOCALHOST" }),
+    [string]$Room = $(if ($env:P2P_SIGNALING_ROOM) { $env:P2P_SIGNALING_ROOM } else { "" }),
     [ValidateSet("host", "guest")]
     [string]$Role = $(if ($env:P2P_SIGNALING_ROLE) { $env:P2P_SIGNALING_ROLE } else { "host" }),
     [ValidateSet("release", "debug")]
@@ -25,7 +25,12 @@ try {
         $Binary = Join-Path $ClientDir "target\debug\p2p-gui.exe"
     }
 
-    & $Binary --server $Server --room $Room --role $Role
+    $Arguments = @("--server", $Server, "--role", $Role)
+    if ($Room) {
+        $Arguments += @("--room", $Room)
+    }
+
+    & $Binary @Arguments
     if ($LASTEXITCODE -ne 0) {
         throw "$Binary exited with code $LASTEXITCODE"
     }

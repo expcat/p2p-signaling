@@ -16,7 +16,8 @@ const PERSIST_EVERY_CHUNKS: u64 = 32;
 
 #[derive(Debug, Clone)]
 pub enum SessionRole {
-    Host { room_code: String },
+    /// 房主不携带房间码：码由服务器在 room-ready 中分配
+    Host,
     Guest { room_code: String },
 }
 
@@ -33,7 +34,8 @@ pub struct FileTransferProgress {
 #[derive(Debug)]
 pub enum SessionEvent {
     Connected,
-    RoomCodeGenerated(String),
+    /// 服务器在 room-ready 中下发的权威房间码
+    RoomCodeAssigned(String),
     PeerConnected,
     PeerDisconnected,
     MessageReceived(String),
@@ -173,7 +175,12 @@ impl ChatSession {
                     Ok(SignalingEnvelope::Error { message }) => {
                         let _ = dispatch_events.send(SessionEvent::Error(message)).await;
                     }
-                    Ok(SignalingEnvelope::RoomReady) => {
+                    Ok(SignalingEnvelope::RoomReady { room_code }) => {
+                        if let Some(code) = room_code {
+                            let _ = dispatch_events
+                                .send(SessionEvent::RoomCodeAssigned(code))
+                                .await;
+                        }
                         let _ = dispatch_events.send(SessionEvent::Connected).await;
                     }
                     Ok(envelope @ SignalingEnvelope::FileOffer { .. })
@@ -201,24 +208,14 @@ impl ChatSession {
         });
 
         let hello = match self.role {
-            SessionRole::Host { room_code } => {
-                event_tx
-                    .send(SessionEvent::RoomCodeGenerated(room_code))
-                    .await?;
-                SignalingEnvelope::Hello {
-                    role: SignalingRole::Host,
-                    room_code: None,
-                }
-            }
-            SessionRole::Guest { room_code } => {
-                event_tx
-                    .send(SessionEvent::RoomCodeGenerated(room_code.clone()))
-                    .await?;
-                SignalingEnvelope::Hello {
-                    role: SignalingRole::Guest,
-                    room_code: Some(room_code),
-                }
-            }
+            SessionRole::Host => SignalingEnvelope::Hello {
+                role: SignalingRole::Host,
+                room_code: None,
+            },
+            SessionRole::Guest { room_code } => SignalingEnvelope::Hello {
+                role: SignalingRole::Guest,
+                room_code: Some(room_code),
+            },
         };
 
         command_tx

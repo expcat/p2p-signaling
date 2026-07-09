@@ -6,7 +6,7 @@ ROOT_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 CLIENT_DIR="${ROOT_DIR}/clients"
 
 SERVER="${P2P_SIGNALING_SERVER:-p2p-signaling.yizhe.studio}"
-ROOM="${P2P_SIGNALING_ROOM:-LOCALHOST}"
+ROOM="${P2P_SIGNALING_ROOM:-}"
 ROLE="${P2P_SIGNALING_ROLE:-host}"
 MODE="release"
 
@@ -36,9 +36,10 @@ while [[ $# -gt 0 ]]; do
       cat <<'EOF'
 Usage: scripts/start-client-macos.sh [--server SERVER] [--room ROOM] [--role host|guest] [--release|--debug]
 
+--room is only used by guests; the host's room code is assigned by the server.
+
 Environment defaults:
   P2P_SIGNALING_SERVER=p2p-signaling.yizhe.studio
-  P2P_SIGNALING_ROOM=LOCALHOST
   P2P_SIGNALING_ROLE=host
 EOF
       exit 0
@@ -60,4 +61,9 @@ else
   BINARY="${CLIENT_DIR}/target/debug/p2p-gui"
 fi
 
-exec "${BINARY}" --server "${SERVER}" --room "${ROOM}" --role "${ROLE}"
+ARGS=(--server "${SERVER}" --role "${ROLE}")
+if [[ -n "${ROOM}" ]]; then
+  ARGS+=(--room "${ROOM}")
+fi
+
+exec "${BINARY}" "${ARGS[@]}"

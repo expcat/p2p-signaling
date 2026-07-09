@@ -39,6 +39,23 @@ function getRoomStub(env: Env, roomCode: string): DurableObjectStub {
   return env.ROOMS.get(id);
 }
 
+const CREATE_ROOM_ATTEMPTS = 5;
+
+function forwardToRoom(
+  env: Env,
+  request: Request,
+  roomCode: string,
+  params: Record<string, string>
+): Promise<Response> {
+  const target = new URL(request.url);
+  target.pathname = `/rooms/${roomCode}`;
+  target.searchParams.set("code", roomCode);
+  for (const [key, value] of Object.entries(params)) {
+    target.searchParams.set(key, value);
+  }
+  return getRoomStub(env, roomCode).fetch(new Request(target, request));
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -47,9 +64,25 @@ export default {
       return json({ ok: true });
     }
 
-    if (url.pathname === "/rooms" && request.method === "POST") {
-      const roomCode = createRoomCode();
-      return json({ roomCode }, { status: 201 });
+    if (url.pathname === "/rooms/new") {
+      if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
+        return json({ error: "expected websocket upgrade" }, { status: 426 });
+      }
+
+      for (let attempt = 0; attempt < CREATE_ROOM_ATTEMPTS; attempt += 1) {
+        const roomCode = createRoomCode();
+        const response = await forwardToRoom(env, request, roomCode, {
+          role: "host",
+          create: "1"
+        });
+
+        // 409 = 房间码已被占用，换码重试
+        if (response.status !== 409) {
+          return response;
+        }
+      }
+
+      return json({ error: "no room code available" }, { status: 503 });
     }
 
     if (url.pathname.startsWith("/rooms/")) {
@@ -58,7 +91,7 @@ export default {
         return json({ error: "missing room code" }, { status: 400 });
       }
 
-      return getRoomStub(env, roomCode).fetch(request);
+      return forwardToRoom(env, request, roomCode, {});
     }
 
     return json({ error: "not found" }, { status: 404 });
@@ -69,6 +102,7 @@ const MAX_PEERS_PER_ROOM = 2;
 
 export class RoomObject {
   private sessions = new Map<WebSocket, ClientRole>();
+  private hostPresent = false;
 
   constructor(private readonly state: DurableObjectState, private readonly env: Env) {
     void this.state;
@@ -80,6 +114,20 @@ export class RoomObject {
       return json({ error: "expected websocket upgrade" }, { status: 426 });
     }
 
+    const url = new URL(request.url);
+    const create = url.searchParams.get("create") === "1";
+    const roomCode = url.searchParams.get("code") ?? "";
+    // 只有经 /rooms/new 创建的连接才是房主，加入已有房间的一律是访客
+    const role: ClientRole = create ? "host" : "guest";
+
+    if (create) {
+      if (this.hostPresent) {
+        return json({ error: "room code taken" }, { status: 409 });
+      }
+    } else if (!this.hostPresent) {
+      return json({ error: "room not found" }, { status: 404 });
+    }
+
     if (this.sessions.size >= MAX_PEERS_PER_ROOM) {
       return json({ error: "room full" }, { status: 409 });
     }
@@ -88,13 +136,16 @@ export class RoomObject {
     const [client, server] = Object.values(pair);
 
     server.accept();
-    this.sessions.set(server, "guest");
+    this.sessions.set(server, role);
+    if (role === "host") {
+      this.hostPresent = true;
+    }
 
     server.addEventListener("message", (event) => this.handleMessage(server, event.data));
     server.addEventListener("close", () => this.disconnect(server));
     server.addEventListener("error", () => this.disconnect(server));
 
-    server.send(JSON.stringify({ type: "room-ready" }));
+    server.send(JSON.stringify({ type: "room-ready", roomCode }));
 
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -119,14 +170,15 @@ export class RoomObject {
     }
 
     if (envelope.type === "hello") {
+      // 角色在连接时由 URL 决定，hello 仅用于触发 peer-joined 通知
+      const senderRole = this.sessions.get(sender) ?? "guest";
       for (const [peer, role] of this.sessions.entries()) {
         if (peer !== sender) {
           sender.send(JSON.stringify({ type: "peer-joined", role }));
         }
       }
 
-      this.sessions.set(sender, envelope.role);
-      this.broadcast(sender, { type: "peer-joined", role: envelope.role });
+      this.broadcast(sender, { type: "peer-joined", role: senderRole });
       return;
     }
 
@@ -176,7 +228,11 @@ export class RoomObject {
 
     for (const peer of this.sessions.keys()) {
       if (peer !== sender) {
-        peer.send(payload);
+        try {
+          peer.send(payload);
+        } catch {
+          // The peer connection may already be gone; its close handler cleans up.
+        }
       }
     }
   }
@@ -187,6 +243,20 @@ export class RoomObject {
 
     if (role) {
       this.broadcast(socket, { type: "peer-left", role });
+    }
+
+    // 房间随房主存活：房主离开即关房，踢出剩余访客；
+    // 访客离开则保留房间，允许重连续传
+    if (role === "host") {
+      this.hostPresent = false;
+      for (const peer of this.sessions.keys()) {
+        this.sessions.delete(peer);
+        try {
+          peer.close(1000, "room closed");
+        } catch {
+          // The socket may already be closed by the runtime.
+        }
+      }
     }
 
     try {

@@ -33,7 +33,10 @@ pub enum SignalingEnvelope {
         #[serde(rename = "roomCode", skip_serializing_if = "Option::is_none")]
         room_code: Option<String>,
     },
-    RoomReady,
+    RoomReady {
+        #[serde(rename = "roomCode", default, skip_serializing_if = "Option::is_none")]
+        room_code: Option<String>,
+    },
     PeerJoined {
         role: SignalingRole,
     },
