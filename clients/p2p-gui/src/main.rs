@@ -9,7 +9,7 @@ use eframe::egui::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::runtime::{Builder, Handle};
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio::sync::oneshot;
@@ -51,6 +51,7 @@ struct ClientConfig {
     room: String,
     role: RoleChoice,
     server_explicit: bool,
+    test_message: Option<String>,
 }
 
 impl ClientConfig {
@@ -60,6 +61,7 @@ impl ClientConfig {
         let mut room = std::env::var("P2P_SIGNALING_ROOM").unwrap_or_else(|_| DEFAULT_ROOM.into());
         let mut role = std::env::var("P2P_SIGNALING_ROLE").unwrap_or_else(|_| "host".into());
         let mut server_explicit = std::env::var("P2P_SIGNALING_SERVER").is_ok();
+        let mut test_message = std::env::var("P2P_SIGNALING_TEST_MESSAGE").ok();
 
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
@@ -73,6 +75,9 @@ impl ClientConfig {
                 }
                 "--role" => {
                     role = require_value(arg.as_str(), args.next())?;
+                }
+                "--test-message" => {
+                    test_message = Some(require_value(arg.as_str(), args.next())?);
                 }
                 "--help" | "-h" => {
                     print_usage();
@@ -91,6 +96,7 @@ impl ClientConfig {
             room: normalize_room_input(&room),
             role: RoleChoice::parse(&role)?,
             server_explicit,
+            test_message,
         })
     }
 }
@@ -172,6 +178,7 @@ struct P2pChatApp {
     state: ConnectionState,
     handle: Option<ChatSessionHandle>,
     event_rx: Option<tokio_mpsc::Receiver<SessionEvent>>,
+    pending_test_message: Option<String>,
     notice_tx: std_mpsc::Sender<UiNotice>,
     notice_rx: std_mpsc::Receiver<UiNotice>,
     config_path: Option<PathBuf>,
@@ -185,6 +192,9 @@ impl P2pChatApp {
         let (notice_tx, notice_rx) = std_mpsc::channel();
         let config_path = config_path();
         let stored = config_path.as_ref().and_then(load_config);
+        let initial_room = initial_config.room.clone();
+        let initial_role = initial_config.role;
+        let pending_test_message = initial_config.test_message;
         let server = if initial_config.server_explicit {
             initial_config.server
         } else {
@@ -206,12 +216,23 @@ impl P2pChatApp {
             state: ConnectionState::Idle,
             handle: None,
             event_rx: None,
+            pending_test_message,
             notice_tx,
             notice_rx,
             config_path,
         };
 
-        if initial_config.role == RoleChoice::Guest && is_valid_room(&app.room_input) {
+        if is_valid_room(&initial_room) {
+            let role = match initial_role {
+                RoleChoice::Host => SessionRole::Host {
+                    room_code: initial_room,
+                },
+                RoleChoice::Guest => SessionRole::Guest {
+                    room_code: initial_room,
+                },
+            };
+            app.start_session(role);
+        } else if initial_role == RoleChoice::Guest {
             app.status = "已填入房间号，可直接加入".into();
         }
 
@@ -265,6 +286,7 @@ impl P2pChatApp {
         let session = ChatSession::new(role, signaling_url);
         match self.runtime.wait(session.start(event_tx)) {
             Ok(Ok(handle)) => {
+                let test_handle = handle.clone();
                 self.handle = Some(handle);
                 self.event_rx = Some(event_rx);
                 self.active_room = Some(room.clone());
@@ -272,6 +294,17 @@ impl P2pChatApp {
                 self.state = ConnectionState::Connecting;
                 self.status = format!("正在连接房间 {room}");
                 self.push_system(format!("房间 {room} {action}，正在连接信令服务。"));
+                if let Some(message) = self.pending_test_message.take() {
+                    self.push_system(format!("将在连接后自动发送测试消息：{message}"));
+                    let notice_tx = self.notice_tx.clone();
+                    self.runtime.spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(1500)).await;
+                        if let Err(error) = test_handle.send_text(message).await {
+                            let _ = notice_tx
+                                .send(UiNotice::Error(format!("发送测试消息失败：{error:#}")));
+                        }
+                    });
+                }
             }
             Ok(Err(error)) | Err(error) => {
                 self.status = format!("{error:#}");
@@ -286,12 +319,21 @@ impl P2pChatApp {
             return;
         }
 
+        if self.handle.is_none() {
+            self.push_system("请先创建或加入房间。");
+            return;
+        }
+
+        self.message_input.clear();
+        self.send_text_message(text);
+    }
+
+    fn send_text_message(&mut self, text: String) {
         let Some(handle) = self.handle.clone() else {
             self.push_system("请先创建或加入房间。");
             return;
         };
 
-        self.message_input.clear();
         self.push_message(ChatAuthor::Mine, text.clone());
 
         let notice_tx = self.notice_tx.clone();
@@ -1165,6 +1207,8 @@ fn is_local_server(server: &str) -> bool {
 fn print_usage() {
     println!(
         "Usage: p2p-gui [SERVER] [--server SERVER] [--room ROOM] [--role host|guest]\n\
+         \n\
+         Optional test automation: --test-message TEXT\n\
          \n\
          SERVER may be a domain, IP, http(s) URL, or ws(s) URL.\n\
          Default: {DEFAULT_SERVER}"
