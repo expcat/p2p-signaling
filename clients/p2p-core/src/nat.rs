@@ -51,6 +51,8 @@ pub struct ConnectInfo {
     pub cert_hash: String,
     #[serde(rename = "pairingToken")]
     pub pairing_token: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
 }
 
 pub struct PreparedConnectInfo {
@@ -106,6 +108,7 @@ pub async fn prepare_connect_info(role: SignalingRole) -> Result<PreparedConnect
         candidates,
         cert_hash: certificate_hash(&certificate.cert_der),
         pairing_token: pairing_token(),
+        capabilities: local_capabilities(),
     };
 
     Ok(PreparedConnectInfo {
@@ -113,6 +116,14 @@ pub async fn prepare_connect_info(role: SignalingRole) -> Result<PreparedConnect
         socket,
         certificate,
     })
+}
+
+fn local_capabilities() -> Vec<String> {
+    if cfg!(target_os = "windows") {
+        vec![crate::remote_desktop::REMOTE_DESKTOP_CAPABILITY.to_string()]
+    } else {
+        Vec::new()
+    }
 }
 
 fn local_candidates(port: u16, ipv4_socket: bool) -> Result<Vec<Candidate>> {
@@ -393,6 +404,7 @@ mod tests {
             }],
             cert_hash: "abcd".into(),
             pairing_token: "token".into(),
+            capabilities: vec![crate::remote_desktop::REMOTE_DESKTOP_CAPABILITY.into()],
         };
 
         let value = serde_json::to_value(info).unwrap();
@@ -402,5 +414,20 @@ mod tests {
         assert_eq!(value["candidates"][0]["kind"], "local");
         assert_eq!(value["certHash"], "abcd");
         assert_eq!(value["pairingToken"], "token");
+        assert_eq!(value["capabilities"][0], "remote-desktop-v1");
+    }
+
+    #[test]
+    fn connect_info_without_capabilities_is_backward_compatible() {
+        let raw = r#"{
+            "kind":"connect-info",
+            "version":1,
+            "role":"host",
+            "candidates":[],
+            "certHash":"hash",
+            "pairingToken":"token"
+        }"#;
+        let info: ConnectInfo = serde_json::from_str(raw).unwrap();
+        assert!(info.capabilities.is_empty());
     }
 }

@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -10,8 +11,12 @@ use tokio::sync::{mpsc, Mutex};
 use crate::direct::{establish_direct_link, DirectLink, DirectLinkInfo};
 use crate::nat::{prepare_connect_info, ConnectInfo, PreparedConnectInfo};
 use crate::p2p_proto::{
-    read_file_stream_header, read_p2p_message, write_file_stream_header, write_p2p_message,
-    FileStreamHeader, P2pMessage,
+    read_p2p_message, read_uni_stream_header, write_file_stream_header, write_p2p_message,
+    write_remote_desktop_frame, FileStreamHeader, IncomingUniStreamHeader, P2pMessage,
+};
+use crate::remote_desktop::{
+    RemoteDesktopConfig, RemoteDesktopControl, RemoteDesktopEvent, RemoteDesktopFrame,
+    RemoteDesktopOffer, RemoteDesktopState, RemoteDisplay, RemoteInputEvent,
 };
 use crate::signaling::{SignalingClient, SignalingCommand, SignalingEnvelope, SignalingRole};
 use crate::transfer::{
@@ -71,6 +76,7 @@ pub enum SessionEvent {
         file_name: String,
         reason: String,
     },
+    RemoteDesktop(RemoteDesktopEvent),
     Error(String),
 }
 
@@ -85,6 +91,8 @@ pub struct ChatSessionHandle {
     signaling_tx: mpsc::Sender<SignalingCommand>,
     direct_tx: mpsc::Sender<DirectCommand>,
     session_tx: mpsc::Sender<SessionCommand>,
+    desktop_frame_tx: mpsc::Sender<RemoteDesktopFrame>,
+    desktop_frame_slot: Arc<StdMutex<Option<RemoteDesktopFrame>>>,
 }
 
 #[derive(Debug)]
@@ -105,7 +113,45 @@ enum DirectCommand {
         transfer_id: String,
         reason: String,
     },
+    OfferRemoteDesktop(RemoteDesktopOffer),
+    AnswerRemoteDesktop {
+        session_id: String,
+        accepted: bool,
+        reason: Option<String>,
+    },
+    SetRemoteDesktopPermission {
+        session_id: String,
+        allow_control: bool,
+    },
+    StopRemoteDesktop {
+        session_id: String,
+        reason: String,
+    },
+    RemoteInput {
+        session_id: String,
+        sequence: u64,
+        event: RemoteInputEvent,
+    },
+    RequestRemoteKeyframe(String),
 }
+
+struct RemoteDesktopRuntimeState {
+    state: RemoteDesktopState,
+    last_input_sequence: u64,
+    last_frame_id: u64,
+}
+
+impl Default for RemoteDesktopRuntimeState {
+    fn default() -> Self {
+        Self {
+            state: RemoteDesktopState::Idle,
+            last_input_sequence: 0,
+            last_frame_id: 0,
+        }
+    }
+}
+
+type SharedRemoteDesktopState = Arc<Mutex<RemoteDesktopRuntimeState>>;
 
 #[derive(Debug)]
 enum SessionCommand {
@@ -147,6 +193,8 @@ impl ChatSession {
         let (incoming_tx, mut incoming_rx) = mpsc::channel::<String>(128);
         let (direct_tx, direct_rx) = mpsc::channel::<DirectCommand>(128);
         let (direct_link_tx, direct_link_rx) = mpsc::channel::<DirectLink>(1);
+        let (desktop_frame_tx, desktop_frame_rx) = mpsc::channel::<RemoteDesktopFrame>(1);
+        let desktop_frame_slot = Arc::new(StdMutex::new(None));
         let (session_tx, mut session_rx) = mpsc::channel::<SessionCommand>(8);
 
         let client = SignalingClient::new(self.signaling_url.clone());
@@ -160,6 +208,8 @@ impl ChatSession {
         tokio::spawn(run_direct_manager(
             direct_rx,
             direct_link_rx,
+            desktop_frame_rx,
+            desktop_frame_slot.clone(),
             event_tx.clone(),
         ));
 
@@ -325,6 +375,8 @@ impl ChatSession {
             signaling_tx,
             direct_tx,
             session_tx,
+            desktop_frame_tx,
+            desktop_frame_slot,
         })
     }
 }
@@ -434,39 +486,62 @@ fn start_direct_link_once(
 async fn run_direct_manager(
     mut command_rx: mpsc::Receiver<DirectCommand>,
     mut link_rx: mpsc::Receiver<DirectLink>,
+    mut desktop_frame_rx: mpsc::Receiver<RemoteDesktopFrame>,
+    desktop_frame_slot: Arc<StdMutex<Option<RemoteDesktopFrame>>>,
     event_tx: mpsc::Sender<SessionEvent>,
 ) {
     while let Some(link) = link_rx.recv().await {
-        run_direct_link(link, &mut command_rx, event_tx.clone()).await;
+        run_direct_link(
+            link,
+            &mut command_rx,
+            &mut desktop_frame_rx,
+            desktop_frame_slot.clone(),
+            event_tx.clone(),
+        )
+        .await;
     }
 }
 
 async fn run_direct_link(
     link: DirectLink,
     command_rx: &mut mpsc::Receiver<DirectCommand>,
+    desktop_frame_rx: &mut mpsc::Receiver<RemoteDesktopFrame>,
+    desktop_frame_slot: Arc<StdMutex<Option<RemoteDesktopFrame>>>,
     event_tx: mpsc::Sender<SessionEvent>,
 ) {
     let info = link.info().clone();
+    let peer_remote_desktop = info.peer_remote_desktop;
     let parts = link.into_parts();
     let connection = parts.connection;
     let endpoint = parts.endpoint;
     let mut send = parts.control_send;
+    let _ = send.set_priority(100);
     let mut recv = parts.control_recv;
     let mut ping = tokio::time::interval(Duration::from_secs(20));
     let store = TransferStore::platform_default().unwrap_or_else(|_| {
         TransferStore::new(std::env::temp_dir().join("p2p-signaling").join("transfers"))
     });
     let transfer_state = Arc::new(Mutex::new(TransferState::new(store)));
+    let remote_desktop_state = Arc::new(Mutex::new(RemoteDesktopRuntimeState::default()));
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<P2pMessage>(128);
+    let (frame_done_tx, mut frame_done_rx) = mpsc::channel::<()>(1);
+    let mut frame_in_flight = false;
     let uni_task = spawn_uni_stream_receiver(
         connection.clone(),
         transfer_state.clone(),
+        remote_desktop_state.clone(),
+        desktop_frame_slot,
         outbound_tx.clone(),
         event_tx.clone(),
     );
 
     let _ = event_tx
         .send(SessionEvent::DirectLinkEstablished(info))
+        .await;
+    let _ = event_tx
+        .send(SessionEvent::RemoteDesktop(
+            RemoteDesktopEvent::PeerAvailabilityChanged(peer_remote_desktop),
+        ))
         .await;
 
     loop {
@@ -506,10 +581,125 @@ async fn run_direct_link(
                             let _ = event_tx.send(SessionEvent::Error(format!("{error:#}"))).await;
                         }
                     }
+                    Some(DirectCommand::OfferRemoteDesktop(offer)) => {
+                        if let Err(error) = offer_remote_desktop(
+                            offer,
+                            peer_remote_desktop,
+                            remote_desktop_state.clone(),
+                            outbound_tx.clone(),
+                            event_tx.clone(),
+                        ).await {
+                            let _ = event_tx.send(SessionEvent::RemoteDesktop(RemoteDesktopEvent::Error {
+                                session_id: None,
+                                message: format!("{error:#}"),
+                            })).await;
+                        }
+                    }
+                    Some(DirectCommand::AnswerRemoteDesktop { session_id, accepted, reason }) => {
+                        if let Err(error) = answer_remote_desktop(
+                            session_id,
+                            accepted,
+                            reason,
+                            remote_desktop_state.clone(),
+                            outbound_tx.clone(),
+                            event_tx.clone(),
+                        ).await {
+                            let _ = event_tx.send(SessionEvent::RemoteDesktop(RemoteDesktopEvent::Error {
+                                session_id: None,
+                                message: format!("{error:#}"),
+                            })).await;
+                        }
+                    }
+                    Some(DirectCommand::SetRemoteDesktopPermission { session_id, allow_control }) => {
+                        if let Err(error) = set_remote_desktop_permission(
+                            session_id,
+                            allow_control,
+                            remote_desktop_state.clone(),
+                            outbound_tx.clone(),
+                            event_tx.clone(),
+                        ).await {
+                            let _ = event_tx.send(SessionEvent::RemoteDesktop(RemoteDesktopEvent::Error {
+                                session_id: None,
+                                message: format!("{error:#}"),
+                            })).await;
+                        }
+                    }
+                    Some(DirectCommand::StopRemoteDesktop { session_id, reason }) => {
+                        if let Err(error) = stop_remote_desktop(
+                            session_id,
+                            reason,
+                            remote_desktop_state.clone(),
+                            outbound_tx.clone(),
+                            event_tx.clone(),
+                        ).await {
+                            let _ = event_tx.send(SessionEvent::RemoteDesktop(RemoteDesktopEvent::Error {
+                                session_id: None,
+                                message: format!("{error:#}"),
+                            })).await;
+                        }
+                    }
+                    Some(DirectCommand::RemoteInput { session_id, sequence, event }) => {
+                        if let Err(error) = send_remote_input(
+                            session_id,
+                            sequence,
+                            event,
+                            remote_desktop_state.clone(),
+                            outbound_tx.clone(),
+                        ).await {
+                            let _ = event_tx.send(SessionEvent::RemoteDesktop(RemoteDesktopEvent::Error {
+                                session_id: None,
+                                message: format!("{error:#}"),
+                            })).await;
+                        }
+                    }
+                    Some(DirectCommand::RequestRemoteKeyframe(session_id)) => {
+                        let _ = outbound_tx.send(P2pMessage::RemoteDesktop {
+                            message: RemoteDesktopControl::KeyframeRequest { session_id },
+                        }).await;
+                    }
                     None => {
                         connection.close(0_u32.into(), b"session closed");
                         break;
                     }
+                }
+            }
+            frame = desktop_frame_rx.recv(), if !frame_in_flight => {
+                let Some(frame) = frame else {
+                    continue;
+                };
+                let can_send = {
+                    let runtime = remote_desktop_state.lock().await;
+                    matches!(
+                        &runtime.state,
+                        RemoteDesktopState::Sharing { session_id, .. }
+                            if session_id == &frame.header.session_id
+                    )
+                };
+                if can_send {
+                    frame_in_flight = true;
+                    let connection = connection.clone();
+                    let event_tx = event_tx.clone();
+                    let frame_done_tx = frame_done_tx.clone();
+                    tokio::spawn(async move {
+                        let session_id = frame.header.session_id.clone();
+                        if let Err(error) = send_remote_desktop_frame_stream(connection, frame).await {
+                            let _ = event_tx.send(SessionEvent::RemoteDesktop(
+                                RemoteDesktopEvent::Error {
+                                    session_id: Some(session_id.clone()),
+                                    message: format!("发送远程桌面帧失败：{error:#}"),
+                                },
+                            )).await;
+                            let _ = event_tx.send(SessionEvent::RemoteDesktop(
+                                RemoteDesktopEvent::KeyframeRequested(session_id),
+                            )).await;
+                        }
+                        let _ = frame_done_tx.send(()).await;
+                    });
+                }
+            }
+            done = frame_done_rx.recv(), if frame_in_flight => {
+                if done.is_some() {
+                    frame_in_flight = false;
                 }
             }
             outbound = outbound_rx.recv() => {
@@ -562,6 +752,21 @@ async fn run_direct_link(
                             let _ = event_tx.send(SessionEvent::Error(format!("{error:#}"))).await;
                         }
                     }
+                    Ok(P2pMessage::RemoteDesktop { message }) => {
+                        if let Err(error) = handle_remote_desktop_control(
+                            message,
+                            remote_desktop_state.clone(),
+                            outbound_tx.clone(),
+                            event_tx.clone(),
+                        ).await {
+                            let _ = event_tx.send(SessionEvent::RemoteDesktop(
+                                RemoteDesktopEvent::Error {
+                                    session_id: None,
+                                    message: format!("远程桌面协议错误：{error:#}"),
+                                },
+                            )).await;
+                        }
+                    }
                     Ok(P2pMessage::Hello { .. }) => {
                         let _ = event_tx
                             .send(SessionEvent::DirectLinkLost("直连控制流收到重复 Hello".into()))
@@ -587,9 +792,473 @@ async fn run_direct_link(
         }
     }
 
+    let previous_remote_state = {
+        let mut runtime = remote_desktop_state.lock().await;
+        std::mem::replace(&mut runtime.state, RemoteDesktopState::Idle)
+    };
+    if matches!(previous_remote_state, RemoteDesktopState::Sharing { .. }) {
+        let _ = event_tx
+            .send(SessionEvent::RemoteDesktop(RemoteDesktopEvent::Input(
+                RemoteInputEvent::ReleaseAll,
+            )))
+            .await;
+    }
+    if !matches!(previous_remote_state, RemoteDesktopState::Idle) {
+        let _ = event_tx
+            .send(SessionEvent::RemoteDesktop(
+                RemoteDesktopEvent::StateChanged(RemoteDesktopState::Idle),
+            ))
+            .await;
+    }
     uni_task.abort();
     connection.close(0_u32.into(), b"direct link stopped");
     endpoint.wait_idle().await;
+}
+
+async fn send_remote_desktop_frame_stream(
+    connection: quinn::Connection,
+    frame: RemoteDesktopFrame,
+) -> Result<()> {
+    let mut stream = connection.open_uni().await?;
+    stream.set_priority(10)?;
+    let result = tokio::time::timeout(Duration::from_millis(750), async {
+        write_remote_desktop_frame(&mut stream, &frame).await?;
+        stream.finish()?;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await;
+    match result {
+        Ok(result) => result,
+        Err(_) => {
+            let _ = stream.reset(16_u32.into());
+            anyhow::bail!("远程桌面帧发送超时")
+        }
+    }
+}
+
+async fn offer_remote_desktop(
+    offer: RemoteDesktopOffer,
+    peer_supported: bool,
+    state: SharedRemoteDesktopState,
+    outbound_tx: mpsc::Sender<P2pMessage>,
+    event_tx: mpsc::Sender<SessionEvent>,
+) -> Result<()> {
+    if !peer_supported {
+        anyhow::bail!("对端客户端不支持远程桌面")
+    }
+    offer.config.validate()?;
+    if offer.session_id.is_empty() || offer.display.width == 0 || offer.display.height == 0 {
+        anyhow::bail!("远程桌面共享参数无效")
+    }
+    let next = RemoteDesktopState::OutgoingPending(offer.clone());
+    {
+        let mut runtime = state.lock().await;
+        if !matches!(runtime.state, RemoteDesktopState::Idle) {
+            anyhow::bail!("已有远程桌面会话")
+        }
+        runtime.state = next.clone();
+        runtime.last_frame_id = 0;
+    }
+    outbound_tx
+        .send(P2pMessage::RemoteDesktop {
+            message: RemoteDesktopControl::Offer { offer },
+        })
+        .await?;
+    event_tx
+        .send(SessionEvent::RemoteDesktop(
+            RemoteDesktopEvent::StateChanged(next),
+        ))
+        .await?;
+    Ok(())
+}
+
+async fn answer_remote_desktop(
+    session_id: String,
+    accepted: bool,
+    reason: Option<String>,
+    state: SharedRemoteDesktopState,
+    outbound_tx: mpsc::Sender<P2pMessage>,
+    event_tx: mpsc::Sender<SessionEvent>,
+) -> Result<()> {
+    let next = {
+        let mut runtime = state.lock().await;
+        let RemoteDesktopState::IncomingPending(offer) = &runtime.state else {
+            anyhow::bail!("没有待处理的远程桌面请求")
+        };
+        if offer.session_id != session_id {
+            anyhow::bail!("远程桌面会话 ID 不匹配")
+        }
+        let next = if accepted {
+            RemoteDesktopState::Viewing {
+                session_id: session_id.clone(),
+                can_control: offer.allow_control,
+            }
+        } else {
+            RemoteDesktopState::Idle
+        };
+        runtime.state = next.clone();
+        runtime.last_frame_id = 0;
+        next
+    };
+    outbound_tx
+        .send(P2pMessage::RemoteDesktop {
+            message: RemoteDesktopControl::Answer {
+                session_id,
+                accepted,
+                reason,
+            },
+        })
+        .await?;
+    event_tx
+        .send(SessionEvent::RemoteDesktop(
+            RemoteDesktopEvent::StateChanged(next),
+        ))
+        .await?;
+    Ok(())
+}
+
+async fn set_remote_desktop_permission(
+    session_id: String,
+    allow_control: bool,
+    state: SharedRemoteDesktopState,
+    outbound_tx: mpsc::Sender<P2pMessage>,
+    event_tx: mpsc::Sender<SessionEvent>,
+) -> Result<()> {
+    let next = {
+        let mut runtime = state.lock().await;
+        match &runtime.state {
+            RemoteDesktopState::Sharing {
+                session_id: active, ..
+            } if active == &session_id => {}
+            _ => anyhow::bail!("当前未共享该远程桌面会话"),
+        }
+        let next = RemoteDesktopState::Sharing {
+            session_id: session_id.clone(),
+            allow_control,
+        };
+        runtime.state = next.clone();
+        next
+    };
+    outbound_tx
+        .send(P2pMessage::RemoteDesktop {
+            message: RemoteDesktopControl::Permission {
+                session_id,
+                allow_control,
+            },
+        })
+        .await?;
+    if !allow_control {
+        let _ = event_tx
+            .send(SessionEvent::RemoteDesktop(RemoteDesktopEvent::Input(
+                RemoteInputEvent::ReleaseAll,
+            )))
+            .await;
+    }
+    event_tx
+        .send(SessionEvent::RemoteDesktop(
+            RemoteDesktopEvent::StateChanged(next),
+        ))
+        .await?;
+    Ok(())
+}
+
+async fn stop_remote_desktop(
+    session_id: String,
+    reason: String,
+    state: SharedRemoteDesktopState,
+    outbound_tx: mpsc::Sender<P2pMessage>,
+    event_tx: mpsc::Sender<SessionEvent>,
+) -> Result<()> {
+    let previous = {
+        let mut runtime = state.lock().await;
+        if remote_state_session_id(&runtime.state) != Some(session_id.as_str()) {
+            anyhow::bail!("远程桌面会话 ID 不匹配")
+        }
+        runtime.last_frame_id = 0;
+        runtime.last_input_sequence = 0;
+        std::mem::replace(&mut runtime.state, RemoteDesktopState::Idle)
+    };
+    outbound_tx
+        .send(P2pMessage::RemoteDesktop {
+            message: RemoteDesktopControl::Stop { session_id, reason },
+        })
+        .await?;
+    if matches!(previous, RemoteDesktopState::Sharing { .. }) {
+        let _ = event_tx
+            .send(SessionEvent::RemoteDesktop(RemoteDesktopEvent::Input(
+                RemoteInputEvent::ReleaseAll,
+            )))
+            .await;
+    }
+    event_tx
+        .send(SessionEvent::RemoteDesktop(
+            RemoteDesktopEvent::StateChanged(RemoteDesktopState::Idle),
+        ))
+        .await?;
+    Ok(())
+}
+
+async fn send_remote_input(
+    session_id: String,
+    sequence: u64,
+    event: RemoteInputEvent,
+    state: SharedRemoteDesktopState,
+    outbound_tx: mpsc::Sender<P2pMessage>,
+) -> Result<()> {
+    event.validate()?;
+    {
+        let runtime = state.lock().await;
+        match &runtime.state {
+            RemoteDesktopState::Viewing {
+                session_id: active,
+                can_control: true,
+            } if active == &session_id => {}
+            _ => anyhow::bail!("远程控制未获授权"),
+        }
+    }
+    outbound_tx
+        .send(P2pMessage::RemoteDesktop {
+            message: RemoteDesktopControl::Input {
+                session_id,
+                sequence,
+                event,
+            },
+        })
+        .await?;
+    Ok(())
+}
+
+async fn handle_remote_desktop_control(
+    message: RemoteDesktopControl,
+    state: SharedRemoteDesktopState,
+    outbound_tx: mpsc::Sender<P2pMessage>,
+    event_tx: mpsc::Sender<SessionEvent>,
+) -> Result<()> {
+    match message {
+        RemoteDesktopControl::Offer { offer } => {
+            offer.config.validate()?;
+            if offer.session_id.is_empty() || offer.display.width == 0 || offer.display.height == 0
+            {
+                anyhow::bail!("远程桌面共享参数无效")
+            }
+            let mut replies = Vec::new();
+            let next = {
+                let runtime = state.lock().await;
+                match &runtime.state {
+                    RemoteDesktopState::Idle => RemoteDesktopState::IncomingPending(offer.clone()),
+                    RemoteDesktopState::OutgoingPending(local)
+                        if offer.session_id < local.session_id =>
+                    {
+                        replies.push(RemoteDesktopControl::Stop {
+                            session_id: local.session_id.clone(),
+                            reason: "同时发起共享，已选择较小会话 ID".into(),
+                        });
+                        RemoteDesktopState::IncomingPending(offer.clone())
+                    }
+                    _ => {
+                        replies.push(RemoteDesktopControl::Answer {
+                            session_id: offer.session_id.clone(),
+                            accepted: false,
+                            reason: Some("已有远程桌面会话".into()),
+                        });
+                        runtime.state.clone()
+                    }
+                }
+            };
+            for reply in replies {
+                outbound_tx
+                    .send(P2pMessage::RemoteDesktop { message: reply })
+                    .await?;
+            }
+            let changed = {
+                let mut runtime = state.lock().await;
+                if runtime.state != next {
+                    runtime.state = next.clone();
+                    runtime.last_frame_id = 0;
+                    true
+                } else {
+                    false
+                }
+            };
+            if changed {
+                event_tx
+                    .send(SessionEvent::RemoteDesktop(
+                        RemoteDesktopEvent::IncomingOffer(offer),
+                    ))
+                    .await?;
+                event_tx
+                    .send(SessionEvent::RemoteDesktop(
+                        RemoteDesktopEvent::StateChanged(next),
+                    ))
+                    .await?;
+            }
+        }
+        RemoteDesktopControl::Answer {
+            session_id,
+            accepted,
+            reason,
+        } => {
+            let (next, sharing_offer) = {
+                let mut runtime = state.lock().await;
+                let RemoteDesktopState::OutgoingPending(offer) = &runtime.state else {
+                    return Ok(());
+                };
+                if offer.session_id != session_id {
+                    return Ok(());
+                }
+                let sharing_offer = accepted.then(|| offer.clone());
+                let next = if accepted {
+                    RemoteDesktopState::Sharing {
+                        session_id: session_id.clone(),
+                        allow_control: offer.allow_control,
+                    }
+                } else {
+                    RemoteDesktopState::Idle
+                };
+                runtime.state = next.clone();
+                runtime.last_frame_id = 0;
+                (next, sharing_offer)
+            };
+            event_tx
+                .send(SessionEvent::RemoteDesktop(
+                    RemoteDesktopEvent::StateChanged(next),
+                ))
+                .await?;
+            if let Some(offer) = sharing_offer {
+                event_tx
+                    .send(SessionEvent::RemoteDesktop(
+                        RemoteDesktopEvent::SharingStarted(offer),
+                    ))
+                    .await?;
+            }
+            if !accepted {
+                event_tx
+                    .send(SessionEvent::RemoteDesktop(RemoteDesktopEvent::Error {
+                        session_id: Some(session_id),
+                        message: reason.unwrap_or_else(|| "对方拒绝观看共享屏幕".into()),
+                    }))
+                    .await?;
+            }
+        }
+        RemoteDesktopControl::Permission {
+            session_id,
+            allow_control,
+        } => {
+            let next = {
+                let mut runtime = state.lock().await;
+                match &runtime.state {
+                    RemoteDesktopState::Viewing {
+                        session_id: active, ..
+                    } if active == &session_id => {}
+                    _ => return Ok(()),
+                }
+                let next = RemoteDesktopState::Viewing {
+                    session_id,
+                    can_control: allow_control,
+                };
+                runtime.state = next.clone();
+                next
+            };
+            event_tx
+                .send(SessionEvent::RemoteDesktop(
+                    RemoteDesktopEvent::StateChanged(next),
+                ))
+                .await?;
+        }
+        RemoteDesktopControl::Stop { session_id, .. } => {
+            let previous = {
+                let mut runtime = state.lock().await;
+                if remote_state_session_id(&runtime.state) != Some(session_id.as_str()) {
+                    return Ok(());
+                }
+                runtime.last_frame_id = 0;
+                runtime.last_input_sequence = 0;
+                std::mem::replace(&mut runtime.state, RemoteDesktopState::Idle)
+            };
+            if matches!(previous, RemoteDesktopState::Sharing { .. }) {
+                let _ = event_tx
+                    .send(SessionEvent::RemoteDesktop(RemoteDesktopEvent::Input(
+                        RemoteInputEvent::ReleaseAll,
+                    )))
+                    .await;
+            }
+            event_tx
+                .send(SessionEvent::RemoteDesktop(
+                    RemoteDesktopEvent::StateChanged(RemoteDesktopState::Idle),
+                ))
+                .await?;
+        }
+        RemoteDesktopControl::Input {
+            session_id,
+            sequence,
+            event,
+        } => {
+            event.validate()?;
+            let allowed = {
+                let mut runtime = state.lock().await;
+                let allowed = matches!(
+                    &runtime.state,
+                    RemoteDesktopState::Sharing {
+                        session_id: active,
+                        allow_control: true,
+                    } if active == &session_id
+                ) && sequence > runtime.last_input_sequence;
+                if allowed {
+                    runtime.last_input_sequence = sequence;
+                }
+                allowed
+            };
+            if allowed {
+                let session_event = SessionEvent::RemoteDesktop(RemoteDesktopEvent::Input(event));
+                if matches!(
+                    &session_event,
+                    SessionEvent::RemoteDesktop(RemoteDesktopEvent::Input(
+                        RemoteInputEvent::PointerMove { .. }
+                    ))
+                ) {
+                    match event_tx.try_send(session_event) {
+                        Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            anyhow::bail!("远程桌面事件通道已关闭")
+                        }
+                    }
+                } else {
+                    event_tx.send(session_event).await?;
+                }
+            }
+        }
+        RemoteDesktopControl::KeyframeRequest { session_id } => {
+            let is_sharing = {
+                let runtime = state.lock().await;
+                matches!(
+                    &runtime.state,
+                    RemoteDesktopState::Sharing {
+                        session_id: active,
+                        ..
+                    } if active == &session_id
+                )
+            };
+            if is_sharing {
+                event_tx
+                    .send(SessionEvent::RemoteDesktop(
+                        RemoteDesktopEvent::KeyframeRequested(session_id),
+                    ))
+                    .await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn remote_state_session_id(state: &RemoteDesktopState) -> Option<&str> {
+    match state {
+        RemoteDesktopState::Idle => None,
+        RemoteDesktopState::OutgoingPending(offer) | RemoteDesktopState::IncomingPending(offer) => {
+            Some(&offer.session_id)
+        }
+        RemoteDesktopState::Sharing { session_id, .. }
+        | RemoteDesktopState::Viewing { session_id, .. } => Some(session_id),
+    }
 }
 
 async fn offer_file(
@@ -940,6 +1609,7 @@ async fn send_file_ranges(
     for range in missing_ranges {
         ensure_not_cancelled(&transfer_id, &state).await?;
         let mut stream = connection.open_uni().await?;
+        let _ = stream.set_priority(-10);
         write_file_stream_header(
             &mut stream,
             &FileStreamHeader {
@@ -982,6 +1652,8 @@ async fn ensure_not_cancelled(transfer_id: &str, state: &SharedTransferState) ->
 fn spawn_uni_stream_receiver(
     connection: quinn::Connection,
     state: SharedTransferState,
+    remote_desktop_state: SharedRemoteDesktopState,
+    desktop_frame_slot: Arc<StdMutex<Option<RemoteDesktopFrame>>>,
     outbound_tx: mpsc::Sender<P2pMessage>,
     event_tx: mpsc::Sender<SessionEvent>,
 ) -> tokio::task::JoinHandle<()> {
@@ -991,9 +1663,11 @@ fn spawn_uni_stream_receiver(
                 Ok(stream) => stream,
                 Err(_) => break,
             };
-            tokio::spawn(receive_file_stream(
+            tokio::spawn(receive_uni_stream(
                 stream,
                 state.clone(),
+                remote_desktop_state.clone(),
+                desktop_frame_slot.clone(),
                 outbound_tx.clone(),
                 event_tx.clone(),
             ));
@@ -1001,33 +1675,45 @@ fn spawn_uni_stream_receiver(
     })
 }
 
-async fn receive_file_stream(
+async fn receive_uni_stream(
     mut stream: quinn::RecvStream,
     state: SharedTransferState,
+    remote_desktop_state: SharedRemoteDesktopState,
+    desktop_frame_slot: Arc<StdMutex<Option<RemoteDesktopFrame>>>,
     outbound_tx: mpsc::Sender<P2pMessage>,
     event_tx: mpsc::Sender<SessionEvent>,
 ) {
-    if let Err(error) = receive_file_stream_inner(
-        &mut stream,
-        state.clone(),
-        outbound_tx.clone(),
-        event_tx.clone(),
-    )
-    .await
-    {
+    let result = match read_uni_stream_header(&mut stream).await {
+        Ok(IncomingUniStreamHeader::File(header)) => {
+            receive_file_stream_inner(&mut stream, header, state, outbound_tx, event_tx.clone())
+                .await
+        }
+        Ok(IncomingUniStreamHeader::RemoteDesktop(header)) => {
+            receive_remote_desktop_frame(
+                &mut stream,
+                header,
+                remote_desktop_state,
+                desktop_frame_slot,
+                event_tx.clone(),
+            )
+            .await
+        }
+        Err(error) => Err(error),
+    };
+    if let Err(error) = result {
         let _ = event_tx
-            .send(SessionEvent::Error(format!("接收文件流失败：{error:#}")))
+            .send(SessionEvent::Error(format!("接收单向流失败：{error:#}")))
             .await;
     }
 }
 
 async fn receive_file_stream_inner(
     stream: &mut quinn::RecvStream,
+    header: FileStreamHeader,
     state: SharedTransferState,
     outbound_tx: mpsc::Sender<P2pMessage>,
     event_tx: mpsc::Sender<SessionEvent>,
 ) -> Result<()> {
-    let header = read_file_stream_header(stream).await?;
     if header.start_chunk >= header.end_chunk {
         anyhow::bail!("文件流分块范围无效");
     }
@@ -1079,6 +1765,47 @@ async fn receive_file_stream_inner(
 
     sink.flush().await?;
     finalize_received_transfer(header.transfer_id, state, outbound_tx, event_tx).await?;
+    Ok(())
+}
+
+async fn receive_remote_desktop_frame(
+    stream: &mut quinn::RecvStream,
+    header: crate::remote_desktop::RemoteDesktopFrameHeader,
+    state: SharedRemoteDesktopState,
+    desktop_frame_slot: Arc<StdMutex<Option<RemoteDesktopFrame>>>,
+    event_tx: mpsc::Sender<SessionEvent>,
+) -> Result<()> {
+    let payload_len = header.validate()?;
+    {
+        let mut runtime = state.lock().await;
+        match &runtime.state {
+            RemoteDesktopState::Viewing { session_id, .. } if session_id == &header.session_id => {}
+            _ => anyhow::bail!("收到非活动会话的远程桌面帧"),
+        }
+        if header.frame_id <= runtime.last_frame_id {
+            return Ok(());
+        }
+        runtime.last_frame_id = header.frame_id;
+    }
+
+    let mut payload = vec![0_u8; payload_len];
+    stream.read_exact(&mut payload).await?;
+    let session_id = header.session_id.clone();
+    let frame_id = header.frame_id;
+    let frame = RemoteDesktopFrame { header, payload };
+    frame.validate()?;
+    {
+        let mut slot = desktop_frame_slot
+            .lock()
+            .map_err(|_| anyhow::anyhow!("远程桌面帧槽已损坏"))?;
+        *slot = Some(frame);
+    }
+    let _ = event_tx.try_send(SessionEvent::RemoteDesktop(
+        RemoteDesktopEvent::FrameAvailable {
+            session_id,
+            frame_id,
+        },
+    ));
     Ok(())
 }
 
@@ -1378,6 +2105,104 @@ impl ChatSessionHandle {
             })
             .await?;
         Ok(())
+    }
+
+    pub async fn offer_remote_desktop(
+        &self,
+        display: RemoteDisplay,
+        config: RemoteDesktopConfig,
+        allow_control: bool,
+    ) -> Result<String> {
+        config.validate()?;
+        let session_id = uuid::Uuid::new_v4().to_string();
+        self.direct_tx
+            .send(DirectCommand::OfferRemoteDesktop(RemoteDesktopOffer {
+                session_id: session_id.clone(),
+                display,
+                config,
+                allow_control,
+            }))
+            .await?;
+        Ok(session_id)
+    }
+
+    pub async fn answer_remote_desktop(
+        &self,
+        session_id: String,
+        accepted: bool,
+        reason: Option<String>,
+    ) -> Result<()> {
+        self.direct_tx
+            .send(DirectCommand::AnswerRemoteDesktop {
+                session_id,
+                accepted,
+                reason,
+            })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn set_remote_desktop_permission(
+        &self,
+        session_id: String,
+        allow_control: bool,
+    ) -> Result<()> {
+        self.direct_tx
+            .send(DirectCommand::SetRemoteDesktopPermission {
+                session_id,
+                allow_control,
+            })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn stop_remote_desktop(&self, session_id: String, reason: String) -> Result<()> {
+        self.direct_tx
+            .send(DirectCommand::StopRemoteDesktop { session_id, reason })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn send_remote_input(
+        &self,
+        session_id: String,
+        sequence: u64,
+        event: RemoteInputEvent,
+    ) -> Result<()> {
+        event.validate()?;
+        self.direct_tx
+            .send(DirectCommand::RemoteInput {
+                session_id,
+                sequence,
+                event,
+            })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn request_remote_keyframe(&self, session_id: String) -> Result<()> {
+        self.direct_tx
+            .send(DirectCommand::RequestRemoteKeyframe(session_id))
+            .await?;
+        Ok(())
+    }
+
+    pub fn try_send_remote_desktop_frame(&self, frame: RemoteDesktopFrame) -> Result<bool> {
+        frame.validate()?;
+        match self.desktop_frame_tx.try_send(frame) {
+            Ok(()) => Ok(true),
+            Err(mpsc::error::TrySendError::Full(_)) => Ok(false),
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                anyhow::bail!("远程桌面帧通道已关闭")
+            }
+        }
+    }
+
+    pub fn take_remote_desktop_frame(&self) -> Option<RemoteDesktopFrame> {
+        self.desktop_frame_slot
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
     }
 
     pub async fn close(&self) -> Result<()> {

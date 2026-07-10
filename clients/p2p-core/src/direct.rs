@@ -25,6 +25,7 @@ const SERVER_NAME: &str = "p2p.local";
 pub struct DirectLinkInfo {
     pub remote_addr: SocketAddr,
     pub local_role: SignalingRole,
+    pub peer_remote_desktop: bool,
 }
 
 pub struct DirectLink {
@@ -94,6 +95,10 @@ async fn accept_direct_link(
     let info = DirectLinkInfo {
         remote_addr: accepted.remote_address(),
         local_role: SignalingRole::Host,
+        peer_remote_desktop: peer
+            .capabilities
+            .iter()
+            .any(|value| value == crate::remote_desktop::REMOTE_DESKTOP_CAPABILITY),
     };
 
     Ok(DirectLink {
@@ -134,6 +139,10 @@ async fn dial_direct_link(
     let info = DirectLinkInfo {
         remote_addr: connection.remote_address(),
         local_role: SignalingRole::Guest,
+        peer_remote_desktop: peer
+            .capabilities
+            .iter()
+            .any(|value| value == crate::remote_desktop::REMOTE_DESKTOP_CAPABILITY),
     };
 
     Ok(DirectLink {

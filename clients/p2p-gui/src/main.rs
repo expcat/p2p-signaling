@@ -5,7 +5,8 @@ use std::thread::JoinHandle;
 
 use eframe::egui::{
     self, Align, Color32, Context, CornerRadius, FontData, FontDefinitions, FontFamily, FontId,
-    Frame, Layout, RichText, ScrollArea, Stroke, TextEdit, Ui, Vec2,
+    Frame, Layout, RichText, ScrollArea, Sense, Stroke, TextEdit, TextureHandle, TextureOptions,
+    Ui, Vec2,
 };
 use serde::{Deserialize, Serialize};
 use tokio::runtime::{Builder, Handle};
@@ -17,6 +18,14 @@ use p2p_core::{
     CandidateKind, ChatSession, ChatSessionHandle, ConnectInfo, FileTransferProgress, SessionEvent,
     SessionRole,
 };
+use p2p_core::{
+    RemoteDesktopEvent, RemoteDesktopOffer, RemoteDesktopState, RemoteDisplay, RemoteInputEvent,
+    RemotePointerButton,
+};
+
+mod remote_desktop;
+
+use remote_desktop::{CaptureEvent, CaptureWorker, FrameDecoder, InputInjector};
 
 const DEFAULT_SERVER: &str = "p2p-signaling.yizhe.studio";
 
@@ -131,6 +140,12 @@ enum ChatAuthor {
     System,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MainView {
+    Chat,
+    RemoteDesktop,
+}
+
 #[derive(Debug, Clone)]
 struct ChatLine {
     author: ChatAuthor,
@@ -198,6 +213,24 @@ struct P2pChatApp {
     notifier: UiNotifier,
     notice_rx: std_mpsc::Receiver<UiNotice>,
     config_path: Option<PathBuf>,
+    main_view: MainView,
+    remote_displays: Vec<RemoteDisplay>,
+    remote_display_index: usize,
+    remote_peer_supported: bool,
+    remote_state: RemoteDesktopState,
+    remote_offer: Option<RemoteDesktopOffer>,
+    remote_allow_control: bool,
+    remote_texture: Option<TextureHandle>,
+    remote_frame_size: Option<[u32; 2]>,
+    remote_decoder: Option<FrameDecoder>,
+    capture_worker: Option<CaptureWorker>,
+    capture_event_tx: std_mpsc::Sender<CaptureEvent>,
+    capture_event_rx: std_mpsc::Receiver<CaptureEvent>,
+    input_injector: Option<InputInjector>,
+    remote_input_sequence: u64,
+    remote_keyboard_captured: bool,
+    remote_modifiers: egui::Modifiers,
+    remote_last_pointer: Option<(u16, u16)>,
 }
 
 impl P2pChatApp {
@@ -206,6 +239,7 @@ impl P2pChatApp {
 
         let runtime = AsyncRuntime::new().expect("failed to create tokio runtime");
         let (notice_tx, notice_rx) = std_mpsc::channel();
+        let (capture_event_tx, capture_event_rx) = std_mpsc::channel();
         let config_path = config_path();
         let stored = config_path.as_ref().and_then(load_config);
         let initial_room = initial_config.room.clone();
@@ -241,6 +275,24 @@ impl P2pChatApp {
             },
             notice_rx,
             config_path,
+            main_view: MainView::Chat,
+            remote_displays: remote_desktop::available_displays().unwrap_or_default(),
+            remote_display_index: 0,
+            remote_peer_supported: false,
+            remote_state: RemoteDesktopState::Idle,
+            remote_offer: None,
+            remote_allow_control: false,
+            remote_texture: None,
+            remote_frame_size: None,
+            remote_decoder: None,
+            capture_worker: None,
+            capture_event_tx,
+            capture_event_rx,
+            input_injector: None,
+            remote_input_sequence: 0,
+            remote_keyboard_captured: false,
+            remote_modifiers: egui::Modifiers::NONE,
+            remote_last_pointer: None,
         };
 
         match initial_role {
@@ -541,6 +593,7 @@ impl P2pChatApp {
     }
 
     fn close_current_session(&mut self) {
+        self.cleanup_remote_desktop();
         if let Some(handle) = self.handle.take() {
             self.runtime.spawn(async move {
                 let _ = handle.close().await;
@@ -575,6 +628,494 @@ impl P2pChatApp {
         });
     }
 
+    fn start_remote_desktop_offer(&mut self) {
+        if self.state != ConnectionState::Direct {
+            self.push_system("请等待直连建立后再共享屏幕。");
+            return;
+        }
+        if !self.remote_peer_supported {
+            self.push_system("对方客户端不支持远程桌面。");
+            return;
+        }
+        if !matches!(self.remote_state, RemoteDesktopState::Idle) {
+            self.push_system("已有远程桌面会话。");
+            return;
+        }
+        let Some(display) = self.remote_displays.get(self.remote_display_index).cloned() else {
+            self.push_system("没有可共享的显示器。");
+            return;
+        };
+        let Some(handle) = self.handle.clone() else {
+            return;
+        };
+        let config = remote_desktop::fit_dimensions(display.width, display.height);
+        let allow_control = self.remote_allow_control;
+        let notifier = self.notifier.clone();
+        self.main_view = MainView::RemoteDesktop;
+        self.runtime.spawn(async move {
+            if let Err(error) = handle
+                .offer_remote_desktop(display, config, allow_control)
+                .await
+            {
+                notifier.error(format!("发起屏幕共享失败：{error:#}"));
+            }
+        });
+    }
+
+    fn answer_remote_desktop_offer(&mut self, accepted: bool) {
+        let Some(offer) = self.remote_offer.clone() else {
+            return;
+        };
+        let Some(handle) = self.handle.clone() else {
+            return;
+        };
+        let notifier = self.notifier.clone();
+        self.runtime.spawn(async move {
+            if let Err(error) = handle
+                .answer_remote_desktop(
+                    offer.session_id,
+                    accepted,
+                    (!accepted).then(|| "用户拒绝观看共享屏幕".into()),
+                )
+                .await
+            {
+                notifier.error(format!("处理屏幕共享请求失败：{error:#}"));
+            }
+        });
+    }
+
+    fn update_remote_control_permission(&mut self, allow_control: bool) {
+        let RemoteDesktopState::Sharing { session_id, .. } = &self.remote_state else {
+            return;
+        };
+        let Some(handle) = self.handle.clone() else {
+            return;
+        };
+        let session_id = session_id.clone();
+        let notifier = self.notifier.clone();
+        self.runtime.spawn(async move {
+            if let Err(error) = handle
+                .set_remote_desktop_permission(session_id, allow_control)
+                .await
+            {
+                notifier.error(format!("更新远程控制权限失败：{error:#}"));
+            }
+        });
+    }
+
+    fn stop_remote_desktop(&mut self, reason: &str) {
+        let Some(session_id) = remote_state_session_id(&self.remote_state).map(str::to_owned)
+        else {
+            return;
+        };
+        let Some(handle) = self.handle.clone() else {
+            return;
+        };
+        let reason = reason.to_string();
+        let notifier = self.notifier.clone();
+        self.runtime.spawn(async move {
+            if let Err(error) = handle.stop_remote_desktop(session_id, reason).await {
+                notifier.error(format!("停止远程桌面失败：{error:#}"));
+            }
+        });
+    }
+
+    fn send_remote_input_event(&mut self, event: RemoteInputEvent) {
+        let RemoteDesktopState::Viewing {
+            session_id,
+            can_control: true,
+        } = &self.remote_state
+        else {
+            return;
+        };
+        let Some(handle) = self.handle.clone() else {
+            return;
+        };
+        self.remote_input_sequence = self.remote_input_sequence.saturating_add(1);
+        let sequence = self.remote_input_sequence;
+        let session_id = session_id.clone();
+        let notifier = self.notifier.clone();
+        self.runtime.spawn(async move {
+            if let Err(error) = handle.send_remote_input(session_id, sequence, event).await {
+                notifier.error(format!("发送远程输入失败：{error:#}"));
+            }
+        });
+    }
+
+    fn handle_remote_desktop_event(&mut self, event: RemoteDesktopEvent) {
+        match event {
+            RemoteDesktopEvent::PeerAvailabilityChanged(supported) => {
+                self.remote_peer_supported = supported;
+                if supported {
+                    self.push_system("对方支持 Windows 远程桌面。");
+                }
+            }
+            RemoteDesktopEvent::IncomingOffer(offer) => {
+                self.remote_offer = Some(offer.clone());
+                self.remote_state = RemoteDesktopState::IncomingPending(offer);
+                self.main_view = MainView::RemoteDesktop;
+                self.push_system("对方请求共享屏幕。");
+            }
+            RemoteDesktopEvent::SharingStarted(offer) => {
+                self.start_capture_worker(offer);
+                self.main_view = MainView::RemoteDesktop;
+            }
+            RemoteDesktopEvent::StateChanged(state) => {
+                let became_idle = matches!(state, RemoteDesktopState::Idle);
+                if let RemoteDesktopState::Viewing { session_id, .. } = &state {
+                    let replace = self
+                        .remote_decoder
+                        .as_ref()
+                        .is_none_or(|_| !matches!(self.remote_state, RemoteDesktopState::Viewing { session_id: ref old, .. } if old == session_id));
+                    if replace {
+                        self.remote_decoder = Some(FrameDecoder::new(session_id.clone()));
+                        self.remote_texture = None;
+                        self.remote_frame_size = None;
+                    }
+                    self.main_view = MainView::RemoteDesktop;
+                }
+                self.remote_state = state;
+                if became_idle {
+                    self.cleanup_remote_desktop_resources();
+                }
+            }
+            RemoteDesktopEvent::FrameAvailable { session_id, .. } => {
+                self.consume_remote_frame(&session_id);
+            }
+            RemoteDesktopEvent::Input(event) => {
+                if let Some(injector) = self.input_injector.as_mut() {
+                    if let Err(error) = injector.inject(&event) {
+                        self.status = format!("远程输入失败：{error:#}");
+                        self.push_system(self.status.clone());
+                    }
+                }
+            }
+            RemoteDesktopEvent::KeyframeRequested(_) => {
+                if let Some(worker) = &self.capture_worker {
+                    worker.force_keyframe();
+                }
+            }
+            RemoteDesktopEvent::Error { message, .. } => {
+                self.status = format!("远程桌面错误：{message}");
+                self.push_system(self.status.clone());
+            }
+        }
+    }
+
+    fn start_capture_worker(&mut self, offer: RemoteDesktopOffer) {
+        self.cleanup_remote_desktop_resources();
+        let Some(handle) = self.handle.clone() else {
+            return;
+        };
+        match InputInjector::new(&offer.display.id) {
+            Ok(injector) => self.input_injector = Some(injector),
+            Err(error) => {
+                self.push_system(format!("初始化远程输入失败：{error:#}"));
+                self.input_injector = None;
+            }
+        }
+        self.capture_worker = Some(CaptureWorker::start(
+            offer,
+            handle,
+            self.capture_event_tx.clone(),
+        ));
+    }
+
+    fn consume_remote_frame(&mut self, session_id: &str) {
+        let Some(frame) = self
+            .handle
+            .as_ref()
+            .and_then(ChatSessionHandle::take_remote_desktop_frame)
+        else {
+            return;
+        };
+        if self.remote_decoder.is_none() {
+            self.remote_decoder = Some(FrameDecoder::new(session_id.to_string()));
+        }
+        let result = self
+            .remote_decoder
+            .as_mut()
+            .expect("remote decoder initialized")
+            .apply(frame);
+        match result {
+            Ok(decoded) => {
+                let image = egui::ColorImage::from_rgba_unmultiplied(
+                    [decoded.width as usize, decoded.height as usize],
+                    &decoded.rgba,
+                );
+                if let Some(texture) = self.remote_texture.as_mut() {
+                    texture.set(image, TextureOptions::LINEAR);
+                } else {
+                    self.remote_texture = Some(self.egui_ctx.load_texture(
+                        "remote-desktop",
+                        image,
+                        TextureOptions::LINEAR,
+                    ));
+                }
+                self.remote_frame_size = Some([decoded.width, decoded.height]);
+            }
+            Err(error) => {
+                let Some(handle) = self.handle.clone() else {
+                    return;
+                };
+                let session_id = session_id.to_string();
+                self.push_system(format!("远程画面需要关键帧：{error:#}"));
+                self.runtime.spawn(async move {
+                    let _ = handle.request_remote_keyframe(session_id).await;
+                });
+            }
+        }
+    }
+
+    fn cleanup_remote_desktop_resources(&mut self) {
+        if let Some(mut worker) = self.capture_worker.take() {
+            worker.stop();
+        }
+        if let Some(injector) = self.input_injector.as_mut() {
+            let _ = injector.inject(&RemoteInputEvent::ReleaseAll);
+        }
+        self.input_injector = None;
+        self.remote_offer = None;
+        self.remote_decoder = None;
+        self.remote_texture = None;
+        self.remote_frame_size = None;
+        self.remote_keyboard_captured = false;
+        self.remote_input_sequence = 0;
+        self.remote_modifiers = egui::Modifiers::NONE;
+        self.remote_last_pointer = None;
+    }
+
+    fn remote_desktop_view(&mut self, ui: &mut Ui) {
+        let state = self.remote_state.clone();
+        match state {
+            RemoteDesktopState::Idle => {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(80.0);
+                    ui.heading("远程桌面未启动");
+                    ui.label("直连建立后，可从左侧选择显示器并发起共享。");
+                });
+            }
+            RemoteDesktopState::OutgoingPending(offer) => {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(80.0);
+                    ui.spinner();
+                    ui.heading("等待对方接受共享");
+                    ui.label(format!(
+                        "{} · {}×{}",
+                        offer.display.name, offer.config.width, offer.config.height
+                    ));
+                });
+            }
+            RemoteDesktopState::IncomingPending(offer) => {
+                Frame::new()
+                    .fill(Color32::from_rgb(18, 24, 33))
+                    .corner_radius(CornerRadius::same(8))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(55, 78, 103)))
+                    .inner_margin(egui::Margin::symmetric(18, 16))
+                    .show(ui, |ui| {
+                        ui.heading("对方请求共享屏幕");
+                        ui.label(format!(
+                            "{} · {}×{} · 最高 {} FPS",
+                            offer.display.name,
+                            offer.config.width,
+                            offer.config.height,
+                            offer.config.max_fps
+                        ));
+                        ui.label(if offer.allow_control {
+                            "共享方已允许本次会话临时控制"
+                        } else {
+                            "本次会话仅观看"
+                        });
+                        ui.add_space(12.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("接受").clicked() {
+                                self.answer_remote_desktop_offer(true);
+                            }
+                            if ui.button("拒绝").clicked() {
+                                self.answer_remote_desktop_offer(false);
+                            }
+                        });
+                    });
+            }
+            RemoteDesktopState::Sharing { allow_control, .. } => {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(80.0);
+                    ui.heading("正在共享本机屏幕");
+                    ui.label(if allow_control {
+                        "对方已获本次会话临时控制权限"
+                    } else {
+                        "对方只能观看；可在左侧随时开启控制"
+                    });
+                    ui.label("停止共享或直连断开时，授权会立即撤销。");
+                });
+            }
+            RemoteDesktopState::Viewing {
+                can_control,
+                session_id: _,
+            } => {
+                let Some(texture) = self.remote_texture.as_ref() else {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(80.0);
+                        ui.spinner();
+                        ui.heading("等待远程画面");
+                    });
+                    return;
+                };
+                let [width, height] = self.remote_frame_size.unwrap_or([1280, 720]);
+                let available = ui.available_size();
+                let scale = (available.x / width as f32)
+                    .min(available.y / height as f32)
+                    .max(0.01);
+                let size = Vec2::new(width as f32 * scale, height as f32 * scale);
+                ui.vertical_centered(|ui| {
+                    ui.label(if can_control {
+                        if self.remote_keyboard_captured {
+                            "控制已启用 · 按 Esc 释放键盘"
+                        } else {
+                            "控制已授权 · 点击画面接管键盘"
+                        }
+                    } else {
+                        "仅观看"
+                    });
+                });
+                let response =
+                    ui.add(egui::Image::new((texture.id(), size)).sense(Sense::click_and_drag()));
+                if can_control {
+                    self.handle_remote_canvas_input(ui, &response);
+                }
+            }
+        }
+    }
+
+    fn handle_remote_canvas_input(&mut self, ui: &Ui, response: &egui::Response) {
+        if response.clicked() {
+            self.remote_keyboard_captured = true;
+        }
+        let escape = ui.input(|input| input.key_pressed(egui::Key::Escape));
+        if escape && self.remote_keyboard_captured {
+            self.remote_keyboard_captured = false;
+            self.send_remote_input_event(RemoteInputEvent::ReleaseAll);
+            self.remote_modifiers = egui::Modifiers::NONE;
+        }
+
+        if let Some(position) = response.hover_pos() {
+            let x = (((position.x - response.rect.left()) / response.rect.width()) * 65535.0)
+                .clamp(0.0, 65535.0) as u16;
+            let y = (((position.y - response.rect.top()) / response.rect.height()) * 65535.0)
+                .clamp(0.0, 65535.0) as u16;
+            if self.remote_last_pointer != Some((x, y)) {
+                self.remote_last_pointer = Some((x, y));
+                self.send_remote_input_event(RemoteInputEvent::PointerMove { x, y });
+            }
+        }
+
+        let buttons = ui.input(|input| {
+            [
+                (
+                    RemotePointerButton::Left,
+                    input.pointer.button_pressed(egui::PointerButton::Primary),
+                    input.pointer.button_released(egui::PointerButton::Primary),
+                ),
+                (
+                    RemotePointerButton::Right,
+                    input.pointer.button_pressed(egui::PointerButton::Secondary),
+                    input
+                        .pointer
+                        .button_released(egui::PointerButton::Secondary),
+                ),
+                (
+                    RemotePointerButton::Middle,
+                    input.pointer.button_pressed(egui::PointerButton::Middle),
+                    input.pointer.button_released(egui::PointerButton::Middle),
+                ),
+            ]
+        });
+        for (button, pressed, released) in buttons {
+            if pressed && response.hovered() {
+                self.send_remote_input_event(RemoteInputEvent::PointerButton {
+                    button,
+                    pressed: true,
+                });
+            }
+            if released {
+                self.send_remote_input_event(RemoteInputEvent::PointerButton {
+                    button,
+                    pressed: false,
+                });
+            }
+        }
+        if response.hovered() {
+            let scroll = ui.input(|input| input.smooth_scroll_delta);
+            if scroll.y != 0.0 {
+                self.send_remote_input_event(RemoteInputEvent::Wheel {
+                    horizontal: false,
+                    delta: scroll.y.clamp(-1200.0, 1200.0) as i32,
+                });
+            }
+            if scroll.x != 0.0 {
+                self.send_remote_input_event(RemoteInputEvent::Wheel {
+                    horizontal: true,
+                    delta: scroll.x.clamp(-1200.0, 1200.0) as i32,
+                });
+            }
+        }
+
+        if !self.remote_keyboard_captured {
+            return;
+        }
+        let (modifiers, events) = ui.input(|input| (input.modifiers, input.events.clone()));
+        self.send_remote_modifier_changes(modifiers);
+        for event in events {
+            match event {
+                egui::Event::Text(text)
+                    if !text.is_empty() && !modifiers.ctrl && !modifiers.alt =>
+                {
+                    self.send_remote_input_event(RemoteInputEvent::Text { text });
+                }
+                egui::Event::Key {
+                    key,
+                    pressed,
+                    repeat,
+                    ..
+                } if key != egui::Key::Escape && (!repeat || !pressed) => {
+                    if let Some((scan_code, extended, printable)) = egui_key_to_scan_code(key) {
+                        if !printable || modifiers.ctrl || modifiers.alt {
+                            self.send_remote_input_event(RemoteInputEvent::Key {
+                                scan_code,
+                                extended,
+                                pressed,
+                            });
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn send_remote_modifier_changes(&mut self, next: egui::Modifiers) {
+        for (was, is, scan_code, extended) in [
+            (self.remote_modifiers.ctrl, next.ctrl, 0x1D, false),
+            (self.remote_modifiers.shift, next.shift, 0x2A, false),
+            (self.remote_modifiers.alt, next.alt, 0x38, false),
+        ] {
+            if was != is {
+                self.send_remote_input_event(RemoteInputEvent::Key {
+                    scan_code,
+                    extended,
+                    pressed: is,
+                });
+            }
+        }
+        self.remote_modifiers = next;
+    }
+
+    fn cleanup_remote_desktop(&mut self) {
+        self.cleanup_remote_desktop_resources();
+        self.remote_state = RemoteDesktopState::Idle;
+        self.remote_peer_supported = false;
+    }
+
     fn poll_background_events(&mut self) {
         while let Ok(notice) = self.notice_rx.try_recv() {
             match notice {
@@ -582,6 +1123,17 @@ impl P2pChatApp {
                     self.status = message.clone();
                     self.push_system(message);
                 }
+            }
+        }
+
+        while let Ok(event) = self.capture_event_rx.try_recv() {
+            match event {
+                CaptureEvent::Error(message) => {
+                    self.status = format!("屏幕采集失败：{message}");
+                    self.push_system(self.status.clone());
+                    self.stop_remote_desktop("屏幕采集失败");
+                }
+                CaptureEvent::Stopped => {}
             }
         }
 
@@ -688,6 +1240,9 @@ impl P2pChatApp {
                     reason,
                 } => {
                     self.push_system(format!("文件已取消：{file_name}，{reason}"));
+                }
+                SessionEvent::RemoteDesktop(event) => {
+                    self.handle_remote_desktop_event(event);
                 }
                 SessionEvent::SignalingClosed => {
                     if self.state == ConnectionState::Direct {
@@ -943,6 +1498,72 @@ impl eframe::App for P2pChatApp {
                     self.retry_direct();
                 }
 
+                ui.separator();
+                ui.label(RichText::new("远程桌面").strong());
+                ui.add_space(6.0);
+                if !remote_desktop::is_supported() {
+                    ui.label("当前平台暂不支持共享屏幕");
+                } else if self.state == ConnectionState::Direct && !self.remote_peer_supported {
+                    ui.label("对方客户端不支持远程桌面");
+                }
+
+                if matches!(self.remote_state, RemoteDesktopState::Idle) {
+                    let selected_name = self
+                        .remote_displays
+                        .get(self.remote_display_index)
+                        .map(|display| display.name.clone())
+                        .unwrap_or_else(|| "无可用显示器".into());
+                    egui::ComboBox::from_id_salt("remote-display")
+                        .selected_text(selected_name)
+                        .width(ui.available_width())
+                        .show_ui(ui, |ui| {
+                            for (index, display) in self.remote_displays.iter().enumerate() {
+                                ui.selectable_value(
+                                    &mut self.remote_display_index,
+                                    index,
+                                    format!(
+                                        "{} ({}×{})",
+                                        display.name, display.width, display.height
+                                    ),
+                                );
+                            }
+                        });
+                    ui.checkbox(&mut self.remote_allow_control, "允许对方临时控制");
+                    let can_share = self.state == ConnectionState::Direct
+                        && self.remote_peer_supported
+                        && !self.remote_displays.is_empty();
+                    if full_width_button(ui, can_share, "共享屏幕", 36.0).clicked() {
+                        self.start_remote_desktop_offer();
+                    }
+                } else {
+                    match &self.remote_state {
+                        RemoteDesktopState::Sharing { allow_control, .. } => {
+                            let mut next = *allow_control;
+                            if ui.checkbox(&mut next, "允许对方临时控制").changed() {
+                                self.update_remote_control_permission(next);
+                            }
+                            ui.label("正在共享本机屏幕");
+                        }
+                        RemoteDesktopState::Viewing { can_control, .. } => {
+                            ui.label(if *can_control {
+                                "正在观看，可临时控制"
+                            } else {
+                                "正在观看，仅查看"
+                            });
+                        }
+                        RemoteDesktopState::OutgoingPending(_) => {
+                            ui.label("等待对方接受共享");
+                        }
+                        RemoteDesktopState::IncomingPending(_) => {
+                            ui.label("收到屏幕共享请求");
+                        }
+                        RemoteDesktopState::Idle => {}
+                    }
+                    if full_width_button(ui, true, "停止远程桌面", 36.0).clicked() {
+                        self.stop_remote_desktop("用户停止远程桌面");
+                    }
+                }
+
                 ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
                     ui.label(RichText::new(&self.status).color(Color32::from_rgb(158, 169, 185)));
                 });
@@ -950,6 +1571,21 @@ impl eframe::App for P2pChatApp {
 
         egui::CentralPanel::default().show(ui, |ui| {
             ui.add_space(8.0);
+            let previous_view = self.main_view;
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.main_view, MainView::Chat, "聊天与文件");
+                ui.selectable_value(&mut self.main_view, MainView::RemoteDesktop, "远程桌面");
+            });
+            if previous_view != self.main_view && self.remote_keyboard_captured {
+                self.remote_keyboard_captured = false;
+                self.send_remote_input_event(RemoteInputEvent::ReleaseAll);
+                self.remote_modifiers = egui::Modifiers::NONE;
+            }
+            ui.separator();
+            if self.main_view == MainView::RemoteDesktop {
+                self.remote_desktop_view(ui);
+                return;
+            }
             let mut transfer_action = None;
             if !self.pending_offers.is_empty() || !self.transfers.is_empty() {
                 Frame::new()
@@ -1491,6 +2127,88 @@ fn is_valid_room(room: &str) -> bool {
 
 fn can_send_to_room(state: ConnectionState, has_handle: bool) -> bool {
     has_handle && state == ConnectionState::Direct
+}
+
+fn remote_state_session_id(state: &RemoteDesktopState) -> Option<&str> {
+    match state {
+        RemoteDesktopState::Idle => None,
+        RemoteDesktopState::OutgoingPending(offer) | RemoteDesktopState::IncomingPending(offer) => {
+            Some(&offer.session_id)
+        }
+        RemoteDesktopState::Sharing { session_id, .. }
+        | RemoteDesktopState::Viewing { session_id, .. } => Some(session_id),
+    }
+}
+
+fn egui_key_to_scan_code(key: egui::Key) -> Option<(u16, bool, bool)> {
+    use egui::Key;
+    let value = match key {
+        Key::Escape => (0x01, false, false),
+        Key::Num1 => (0x02, false, true),
+        Key::Num2 => (0x03, false, true),
+        Key::Num3 => (0x04, false, true),
+        Key::Num4 => (0x05, false, true),
+        Key::Num5 => (0x06, false, true),
+        Key::Num6 => (0x07, false, true),
+        Key::Num7 => (0x08, false, true),
+        Key::Num8 => (0x09, false, true),
+        Key::Num9 => (0x0A, false, true),
+        Key::Num0 => (0x0B, false, true),
+        Key::Backspace => (0x0E, false, false),
+        Key::Tab => (0x0F, false, false),
+        Key::Q => (0x10, false, true),
+        Key::W => (0x11, false, true),
+        Key::E => (0x12, false, true),
+        Key::R => (0x13, false, true),
+        Key::T => (0x14, false, true),
+        Key::Y => (0x15, false, true),
+        Key::U => (0x16, false, true),
+        Key::I => (0x17, false, true),
+        Key::O => (0x18, false, true),
+        Key::P => (0x19, false, true),
+        Key::Enter => (0x1C, false, false),
+        Key::A => (0x1E, false, true),
+        Key::S => (0x1F, false, true),
+        Key::D => (0x20, false, true),
+        Key::F => (0x21, false, true),
+        Key::G => (0x22, false, true),
+        Key::H => (0x23, false, true),
+        Key::J => (0x24, false, true),
+        Key::K => (0x25, false, true),
+        Key::L => (0x26, false, true),
+        Key::Z => (0x2C, false, true),
+        Key::X => (0x2D, false, true),
+        Key::C => (0x2E, false, true),
+        Key::V => (0x2F, false, true),
+        Key::B => (0x30, false, true),
+        Key::N => (0x31, false, true),
+        Key::M => (0x32, false, true),
+        Key::Space => (0x39, false, false),
+        Key::F1 => (0x3B, false, false),
+        Key::F2 => (0x3C, false, false),
+        Key::F3 => (0x3D, false, false),
+        Key::F4 => (0x3E, false, false),
+        Key::F5 => (0x3F, false, false),
+        Key::F6 => (0x40, false, false),
+        Key::F7 => (0x41, false, false),
+        Key::F8 => (0x42, false, false),
+        Key::F9 => (0x43, false, false),
+        Key::F10 => (0x44, false, false),
+        Key::Home => (0x47, true, false),
+        Key::ArrowUp => (0x48, true, false),
+        Key::PageUp => (0x49, true, false),
+        Key::ArrowLeft => (0x4B, true, false),
+        Key::ArrowRight => (0x4D, true, false),
+        Key::End => (0x4F, true, false),
+        Key::ArrowDown => (0x50, true, false),
+        Key::PageDown => (0x51, true, false),
+        Key::Insert => (0x52, true, false),
+        Key::Delete => (0x53, true, false),
+        Key::F11 => (0x57, false, false),
+        Key::F12 => (0x58, false, false),
+        _ => return None,
+    };
+    Some(value)
 }
 
 fn state_after_connected_event(state: ConnectionState) -> ConnectionState {
