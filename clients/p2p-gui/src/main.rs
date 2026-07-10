@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::mpsc as std_mpsc;
@@ -230,6 +231,7 @@ struct P2pChatApp {
     remote_input_sequence: u64,
     remote_keyboard_captured: bool,
     remote_modifiers: egui::Modifiers,
+    remote_pressed_scan_codes: HashSet<(u16, bool)>,
     remote_last_pointer: Option<(u16, u16)>,
 }
 
@@ -292,6 +294,7 @@ impl P2pChatApp {
             remote_input_sequence: 0,
             remote_keyboard_captured: false,
             remote_modifiers: egui::Modifiers::NONE,
+            remote_pressed_scan_codes: HashSet::new(),
             remote_last_pointer: None,
         };
 
@@ -628,6 +631,21 @@ impl P2pChatApp {
         });
     }
 
+    fn refresh_remote_displays(&mut self) {
+        let selected_id = self
+            .remote_displays
+            .get(self.remote_display_index)
+            .map(|display| display.id.clone());
+        self.remote_displays = remote_desktop::available_displays().unwrap_or_default();
+        self.remote_display_index = selected_id
+            .and_then(|id| {
+                self.remote_displays
+                    .iter()
+                    .position(|display| display.id == id)
+            })
+            .unwrap_or(0);
+    }
+
     fn start_remote_desktop_offer(&mut self) {
         if self.state != ConnectionState::Direct {
             self.push_system("请等待直连建立后再共享屏幕。");
@@ -641,6 +659,8 @@ impl P2pChatApp {
             self.push_system("已有远程桌面会话。");
             return;
         }
+        // 显示器可能在启动后插拔，发起前用最新列表校验选择
+        self.refresh_remote_displays();
         if let Err(error) = remote_desktop::ensure_screen_capture_permission() {
             self.push_system(format!("无法共享屏幕：{error:#}"));
             return;
@@ -880,16 +900,16 @@ impl P2pChatApp {
         if self.remote_decoder.is_none() {
             self.remote_decoder = Some(FrameDecoder::new(session_id.to_string()));
         }
-        let result = self
+        let decoder = self
             .remote_decoder
             .as_mut()
-            .expect("remote decoder initialized")
-            .apply(frame);
-        match result {
-            Ok(decoded) => {
+            .expect("remote decoder initialized");
+        match decoder.apply(frame) {
+            Ok(()) => {
+                let (width, height) = decoder.size();
                 let image = egui::ColorImage::from_rgba_unmultiplied(
-                    [decoded.width as usize, decoded.height as usize],
-                    &decoded.rgba,
+                    [width as usize, height as usize],
+                    decoder.canvas(),
                 );
                 if let Some(texture) = self.remote_texture.as_mut() {
                     texture.set(image, TextureOptions::LINEAR);
@@ -900,7 +920,7 @@ impl P2pChatApp {
                         TextureOptions::LINEAR,
                     ));
                 }
-                self.remote_frame_size = Some([decoded.width, decoded.height]);
+                self.remote_frame_size = Some([width, height]);
             }
             Err(error) => {
                 let Some(handle) = self.handle.clone() else {
@@ -930,6 +950,7 @@ impl P2pChatApp {
         self.remote_keyboard_captured = false;
         self.remote_input_sequence = 0;
         self.remote_modifiers = egui::Modifiers::NONE;
+        self.remote_pressed_scan_codes.clear();
         self.remote_last_pointer = None;
     }
 
@@ -1001,7 +1022,7 @@ impl P2pChatApp {
                 can_control,
                 session_id: _,
             } => {
-                let Some(texture) = self.remote_texture.as_ref() else {
+                let Some(texture_id) = self.remote_texture.as_ref().map(TextureHandle::id) else {
                     ui.vertical_centered(|ui| {
                         ui.add_space(80.0);
                         ui.spinner();
@@ -1016,18 +1037,24 @@ impl P2pChatApp {
                     .max(0.01);
                 let size = Vec2::new(width as f32 * scale, height as f32 * scale);
                 ui.vertical_centered(|ui| {
-                    ui.label(if can_control {
-                        if self.remote_keyboard_captured {
-                            "控制已启用 · 按 Esc 释放键盘"
+                    ui.horizontal(|ui| {
+                        ui.label(if can_control {
+                            if self.remote_keyboard_captured {
+                                "控制已启用 · 按 Esc 释放键盘"
+                            } else {
+                                "控制已授权 · 点击画面接管键盘"
+                            }
                         } else {
-                            "控制已授权 · 点击画面接管键盘"
+                            "仅观看"
+                        });
+                        // 本地 Esc 被用作释放键盘，远端的 Esc 只能通过按钮发送
+                        if can_control && ui.small_button("发送 Esc").clicked() {
+                            self.send_remote_esc();
                         }
-                    } else {
-                        "仅观看"
                     });
                 });
                 let response =
-                    ui.add(egui::Image::new((texture.id(), size)).sense(Sense::click_and_drag()));
+                    ui.add(egui::Image::new((texture_id, size)).sense(Sense::click_and_drag()));
                 if can_control {
                     self.handle_remote_canvas_input(ui, &response);
                 }
@@ -1041,9 +1068,7 @@ impl P2pChatApp {
         }
         let escape = ui.input(|input| input.key_pressed(egui::Key::Escape));
         if escape && self.remote_keyboard_captured {
-            self.remote_keyboard_captured = false;
-            self.send_remote_input_event(RemoteInputEvent::ReleaseAll);
-            self.remote_modifiers = egui::Modifiers::NONE;
+            self.release_remote_keyboard();
         }
 
         if let Some(position) = response.hover_pos() {
@@ -1139,11 +1164,23 @@ impl P2pChatApp {
                     ..
                 } if key != egui::Key::Escape && (!repeat || !pressed) => {
                     if let Some((scan_code, extended, printable)) = egui_key_to_scan_code(key) {
-                        if !printable || modifiers.command || modifiers.ctrl || modifiers.alt {
+                        if pressed {
+                            // 可打印字符走 Text 事件；组合键才作为按键发送
+                            if !printable || modifiers.command || modifiers.ctrl || modifiers.alt {
+                                self.remote_pressed_scan_codes.insert((scan_code, extended));
+                                self.send_remote_input_event(RemoteInputEvent::Key {
+                                    scan_code,
+                                    extended,
+                                    pressed: true,
+                                });
+                            }
+                        } else if self.remote_pressed_scan_codes.remove(&(scan_code, extended)) {
+                            // 已发送按下的键必须发送抬起，即使修饰键已先松开，
+                            // 否则 host 端按键会一直保持按下
                             self.send_remote_input_event(RemoteInputEvent::Key {
                                 scan_code,
                                 extended,
-                                pressed,
+                                pressed: false,
                             });
                         }
                     }
@@ -1155,12 +1192,32 @@ impl P2pChatApp {
 
     fn send_remote_shortcut_key(&mut self, key: egui::Key) {
         if let Some((scan_code, extended, _)) = egui_key_to_scan_code(key) {
+            // egui 会吞掉快捷键组合的 keydown，但物理松开仍会派发 keyup，
+            // 记入集合由通用 release 逻辑兜底抬起
+            self.remote_pressed_scan_codes.insert((scan_code, extended));
             self.send_remote_input_event(RemoteInputEvent::Key {
                 scan_code,
                 extended,
                 pressed: true,
             });
         }
+    }
+
+    fn send_remote_esc(&mut self) {
+        for pressed in [true, false] {
+            self.send_remote_input_event(RemoteInputEvent::Key {
+                scan_code: 0x01,
+                extended: false,
+                pressed,
+            });
+        }
+    }
+
+    fn release_remote_keyboard(&mut self) {
+        self.remote_keyboard_captured = false;
+        self.send_remote_input_event(RemoteInputEvent::ReleaseAll);
+        self.remote_modifiers = egui::Modifiers::NONE;
+        self.remote_pressed_scan_codes.clear();
     }
 
     fn send_remote_modifier_changes(&mut self, next: egui::Modifiers) {
@@ -1601,6 +1658,9 @@ impl eframe::App for P2pChatApp {
                                 );
                             }
                         });
+                    if ui.small_button("刷新显示器列表").clicked() {
+                        self.refresh_remote_displays();
+                    }
                     ui.checkbox(&mut self.remote_allow_control, "允许对方临时控制");
                     let can_share = self.state == ConnectionState::Direct
                         && self.remote_peer_supported
@@ -1650,9 +1710,7 @@ impl eframe::App for P2pChatApp {
                 ui.selectable_value(&mut self.main_view, MainView::RemoteDesktop, "远程桌面");
             });
             if previous_view != self.main_view && self.remote_keyboard_captured {
-                self.remote_keyboard_captured = false;
-                self.send_remote_input_event(RemoteInputEvent::ReleaseAll);
-                self.remote_modifiers = egui::Modifiers::NONE;
+                self.release_remote_keyboard();
             }
             ui.separator();
             if self.main_view == MainView::RemoteDesktop {
@@ -2279,6 +2337,18 @@ fn egui_key_to_scan_code(key: egui::Key) -> Option<(u16, bool, bool)> {
         Key::Delete => (0x53, true, false),
         Key::F11 => (0x57, false, false),
         Key::F12 => (0x58, false, false),
+        // 标点（按美式布局的物理键位），供 Ctrl+-/Ctrl+= 等组合键使用
+        Key::Minus => (0x0C, false, true),
+        Key::Plus | Key::Equals => (0x0D, false, true),
+        Key::OpenBracket | Key::OpenCurlyBracket => (0x1A, false, true),
+        Key::CloseBracket | Key::CloseCurlyBracket => (0x1B, false, true),
+        Key::Semicolon | Key::Colon => (0x27, false, true),
+        Key::Quote => (0x28, false, true),
+        Key::Backtick => (0x29, false, true),
+        Key::Backslash | Key::Pipe => (0x2B, false, true),
+        Key::Comma => (0x33, false, true),
+        Key::Period => (0x34, false, true),
+        Key::Slash | Key::Questionmark => (0x35, false, true),
         _ => return None,
     };
     Some(value)
@@ -2497,6 +2567,29 @@ mod tests {
         assert_eq!(finite_width(f32::NAN, 120.0), 120.0);
         assert_eq!(row_text_width(f32::INFINITY), 120.0);
         assert_eq!(row_text_width(420.0), 236.0);
+    }
+
+    #[test]
+    fn maps_punctuation_keys_to_pc_scan_codes() {
+        for (key, scan_code) in [
+            (egui::Key::Minus, 0x0C_u16),
+            (egui::Key::Equals, 0x0D),
+            (egui::Key::OpenBracket, 0x1A),
+            (egui::Key::CloseBracket, 0x1B),
+            (egui::Key::Semicolon, 0x27),
+            (egui::Key::Quote, 0x28),
+            (egui::Key::Backtick, 0x29),
+            (egui::Key::Backslash, 0x2B),
+            (egui::Key::Comma, 0x33),
+            (egui::Key::Period, 0x34),
+            (egui::Key::Slash, 0x35),
+        ] {
+            assert_eq!(
+                egui_key_to_scan_code(key),
+                Some((scan_code, false, true)),
+                "{key:?}"
+            );
+        }
     }
 
     #[test]

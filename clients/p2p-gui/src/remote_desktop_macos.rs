@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use block2::RcBlock;
@@ -10,10 +10,10 @@ use objc2::runtime::ProtocolObject;
 use objc2::{define_class, msg_send, AnyThread, DefinedClass};
 use objc2_core_foundation::{CGPoint, CGRect};
 use objc2_core_graphics::{
-    CGDisplayBounds, CGDisplayPixelsHigh, CGDisplayPixelsWide, CGError, CGEvent,
-    CGEventTapLocation, CGEventType, CGGetActiveDisplayList, CGMainDisplayID, CGMouseButton,
-    CGPreflightPostEventAccess, CGPreflightScreenCaptureAccess, CGRequestPostEventAccess,
-    CGRequestScreenCaptureAccess, CGScrollEventUnit,
+    CGDisplayBounds, CGDisplayPixelsHigh, CGDisplayPixelsWide, CGError, CGEvent, CGEventField,
+    CGEventFlags, CGEventTapLocation, CGEventType, CGGetActiveDisplayList, CGMainDisplayID,
+    CGMouseButton, CGPreflightPostEventAccess, CGPreflightScreenCaptureAccess,
+    CGRequestPostEventAccess, CGRequestScreenCaptureAccess, CGScrollEventUnit,
 };
 use objc2_core_media::{CMSampleBuffer, CMTime};
 use objc2_core_video::{
@@ -358,11 +358,25 @@ fn bgra_rows_to_rgba(
     Ok(rgba)
 }
 
+const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
+const DOUBLE_CLICK_SLOP: f64 = 5.0;
+
+#[derive(Debug, Clone, Copy)]
+struct LastClick {
+    at: Instant,
+    x: f64,
+    y: f64,
+    button: RemotePointerButton,
+    count: i64,
+}
+
 pub struct InputInjector {
     bounds: CGRect,
     current: CGPoint,
     pressed_keys: HashSet<(u16, bool)>,
     pressed_buttons: HashSet<RemotePointerButton>,
+    last_click: Option<LastClick>,
+    click_count: i64,
 }
 
 impl InputInjector {
@@ -384,6 +398,8 @@ impl InputInjector {
             current,
             pressed_keys: HashSet::new(),
             pressed_buttons: HashSet::new(),
+            last_click: None,
+            click_count: 1,
         })
     }
 
@@ -411,6 +427,7 @@ impl InputInjector {
                     0,
                 )
                 .context("创建 macOS 滚轮事件失败")?;
+                CGEvent::set_flags(Some(&event), self.modifier_flags());
                 CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
                 Ok(())
             }
@@ -455,6 +472,18 @@ impl InputInjector {
                 (CGEventType::OtherMouseUp, CGMouseButton::Center)
             }
         };
+        if pressed {
+            let now = Instant::now();
+            self.click_count =
+                next_click_count(self.last_click.as_ref(), now, self.current, button);
+            self.last_click = Some(LastClick {
+                at: now,
+                x: self.current.x,
+                y: self.current.y,
+                button,
+                count: self.click_count,
+            });
+        }
         self.post_mouse(event_type, cg_button)?;
         if pressed {
             self.pressed_buttons.insert(button);
@@ -467,6 +496,15 @@ impl InputInjector {
     fn post_mouse(&self, event_type: CGEventType, button: CGMouseButton) -> Result<()> {
         let event = CGEvent::new_mouse_event(None, event_type, self.current, button)
             .context("创建 macOS 鼠标事件失败")?;
+        // 双击识别依赖 clickState；纯移动事件（MouseMoved）无需设置
+        if event_type != CGEventType::MouseMoved {
+            CGEvent::set_integer_value_field(
+                Some(&event),
+                CGEventField::MouseEventClickState,
+                self.click_count,
+            );
+        }
+        CGEvent::set_flags(Some(&event), self.modifier_flags());
         CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
         Ok(())
     }
@@ -474,14 +512,17 @@ impl InputInjector {
     fn key(&mut self, scan_code: u16, extended: bool, pressed: bool) -> Result<()> {
         let key_code = scan_code_to_macos(scan_code, extended)
             .ok_or_else(|| anyhow::anyhow!("不支持的远程扫描码：{scan_code:#x}"))?;
-        let event = CGEvent::new_keyboard_event(None, key_code, pressed)
-            .context("创建 macOS 键盘事件失败")?;
-        CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
+        // 先更新按键集合再取 flags：修饰键按下事件携带自身掩码、抬起事件不携带，
+        // 与 macOS flagsChanged 的语义一致
         if pressed {
             self.pressed_keys.insert((scan_code, extended));
         } else {
             self.pressed_keys.remove(&(scan_code, extended));
         }
+        let event = CGEvent::new_keyboard_event(None, key_code, pressed)
+            .context("创建 macOS 键盘事件失败")?;
+        CGEvent::set_flags(Some(&event), self.modifier_flags());
+        CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
         Ok(())
     }
 
@@ -498,9 +539,14 @@ impl InputInjector {
                     units.as_ptr(),
                 )
             };
+            CGEvent::set_flags(Some(&event), self.modifier_flags());
             CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
         }
         Ok(())
+    }
+
+    fn modifier_flags(&self) -> CGEventFlags {
+        flags_for_pressed(&self.pressed_keys)
     }
 
     fn release_all(&mut self) -> Result<()> {
@@ -517,10 +563,44 @@ impl InputInjector {
 }
 
 fn normalized_point(bounds: CGRect, x: u16, y: u16) -> CGPoint {
+    // 与 Windows 端一致按 (宽高 - 1) 缩放，65535 恰好落在显示器最后一像素上
     CGPoint::new(
-        bounds.origin.x + x as f64 * bounds.size.width.max(1.0) / 65535.0,
-        bounds.origin.y + y as f64 * bounds.size.height.max(1.0) / 65535.0,
+        bounds.origin.x + x as f64 * (bounds.size.width - 1.0).max(0.0) / 65535.0,
+        bounds.origin.y + y as f64 * (bounds.size.height - 1.0).max(0.0) / 65535.0,
     )
+}
+
+fn flags_for_pressed(pressed_keys: &HashSet<(u16, bool)>) -> CGEventFlags {
+    let mut flags = CGEventFlags::empty();
+    for &(scan_code, extended) in pressed_keys {
+        match (scan_code, extended) {
+            (0x2A | 0x36, false) => flags |= CGEventFlags::MaskShift,
+            (0x1D, _) => flags |= CGEventFlags::MaskControl,
+            (0x38, _) => flags |= CGEventFlags::MaskAlternate,
+            (0x5B | 0x5C, true) => flags |= CGEventFlags::MaskCommand,
+            _ => {}
+        }
+    }
+    flags
+}
+
+fn next_click_count(
+    previous: Option<&LastClick>,
+    now: Instant,
+    point: CGPoint,
+    button: RemotePointerButton,
+) -> i64 {
+    match previous {
+        Some(last)
+            if last.button == button
+                && now.duration_since(last.at) <= DOUBLE_CLICK_INTERVAL
+                && (point.x - last.x).abs() <= DOUBLE_CLICK_SLOP
+                && (point.y - last.y).abs() <= DOUBLE_CLICK_SLOP =>
+        {
+            last.count + 1
+        }
+        _ => 1,
+    }
 }
 
 fn scan_code_to_macos(scan_code: u16, extended: bool) -> Option<u16> {
@@ -539,6 +619,7 @@ fn scan_code_to_macos(scan_code: u16, extended: bool) -> Option<u16> {
             0x52 => 0x72,
             0x53 => 0x75,
             0x5B => 0x37,
+            0x5C => 0x36,
             _ => return None,
         });
     }
@@ -554,6 +635,8 @@ fn scan_code_to_macos(scan_code: u16, extended: bool) -> Option<u16> {
         0x09 => 0x1C,
         0x0A => 0x19,
         0x0B => 0x1D,
+        0x0C => 0x1B,
+        0x0D => 0x18,
         0x0E => 0x33,
         0x0F => 0x30,
         0x10 => 0x0C,
@@ -566,6 +649,8 @@ fn scan_code_to_macos(scan_code: u16, extended: bool) -> Option<u16> {
         0x17 => 0x22,
         0x18 => 0x1F,
         0x19 => 0x23,
+        0x1A => 0x21,
+        0x1B => 0x1E,
         0x1C => 0x24,
         0x1D => 0x3B,
         0x1E => 0x00,
@@ -577,7 +662,11 @@ fn scan_code_to_macos(scan_code: u16, extended: bool) -> Option<u16> {
         0x24 => 0x26,
         0x25 => 0x28,
         0x26 => 0x25,
+        0x27 => 0x29,
+        0x28 => 0x27,
+        0x29 => 0x32,
         0x2A => 0x38,
+        0x2B => 0x2A,
         0x2C => 0x06,
         0x2D => 0x07,
         0x2E => 0x08,
@@ -585,6 +674,10 @@ fn scan_code_to_macos(scan_code: u16, extended: bool) -> Option<u16> {
         0x30 => 0x0B,
         0x31 => 0x2D,
         0x32 => 0x2E,
+        0x33 => 0x2B,
+        0x34 => 0x2F,
+        0x35 => 0x2C,
+        0x36 => 0x3C,
         0x38 => 0x3A,
         0x39 => 0x31,
         0x3B => 0x7A,
@@ -627,6 +720,26 @@ mod tests {
     }
 
     #[test]
+    fn maps_punctuation_scan_codes() {
+        // 减号、等号、分号、引号、逗号、句号、斜杠、反斜杠、反引号、方括号
+        for (pc, mac) in [
+            (0x0C_u16, 0x1B_u16),
+            (0x0D, 0x18),
+            (0x1A, 0x21),
+            (0x1B, 0x1E),
+            (0x27, 0x29),
+            (0x28, 0x27),
+            (0x29, 0x32),
+            (0x2B, 0x2A),
+            (0x33, 0x2B),
+            (0x34, 0x2F),
+            (0x35, 0x2C),
+        ] {
+            assert_eq!(scan_code_to_macos(pc, false), Some(mac), "扫描码 {pc:#x}");
+        }
+    }
+
+    #[test]
     fn maps_normalized_points_into_offset_display() {
         let bounds = CGRect::new(
             CGPoint::new(-1920.0, 100.0),
@@ -635,7 +748,86 @@ mod tests {
         assert_eq!(normalized_point(bounds, 0, 0), CGPoint::new(-1920.0, 100.0));
         assert_eq!(
             normalized_point(bounds, 65535, 65535),
-            CGPoint::new(0.0, 1180.0)
+            CGPoint::new(-1.0, 1179.0)
+        );
+    }
+
+    #[test]
+    fn accumulates_modifier_flags_from_pressed_keys() {
+        let mut pressed = HashSet::new();
+        assert_eq!(flags_for_pressed(&pressed), CGEventFlags::empty());
+        pressed.insert((0x1D, false));
+        pressed.insert((0x2A, false));
+        assert_eq!(
+            flags_for_pressed(&pressed),
+            CGEventFlags::MaskControl | CGEventFlags::MaskShift
+        );
+        pressed.insert((0x5B, true));
+        pressed.insert((0x38, false));
+        pressed.insert((0x2E, false));
+        assert_eq!(
+            flags_for_pressed(&pressed),
+            CGEventFlags::MaskControl
+                | CGEventFlags::MaskShift
+                | CGEventFlags::MaskCommand
+                | CGEventFlags::MaskAlternate
+        );
+        // 非扩展 0x5B 不是 Command
+        assert_eq!(
+            flags_for_pressed(&HashSet::from([(0x5B, false)])),
+            CGEventFlags::empty()
+        );
+    }
+
+    #[test]
+    fn counts_double_clicks_within_threshold() {
+        let start = Instant::now();
+        let point = CGPoint::new(10.0, 10.0);
+        let first = next_click_count(None, start, point, RemotePointerButton::Left);
+        assert_eq!(first, 1);
+        let last = LastClick {
+            at: start,
+            x: point.x,
+            y: point.y,
+            button: RemotePointerButton::Left,
+            count: first,
+        };
+        assert_eq!(
+            next_click_count(
+                Some(&last),
+                start + Duration::from_millis(200),
+                CGPoint::new(12.0, 9.0),
+                RemotePointerButton::Left,
+            ),
+            2
+        );
+        // 超时、移动过远、按键不同都会重置
+        assert_eq!(
+            next_click_count(
+                Some(&last),
+                start + Duration::from_millis(800),
+                point,
+                RemotePointerButton::Left,
+            ),
+            1
+        );
+        assert_eq!(
+            next_click_count(
+                Some(&last),
+                start + Duration::from_millis(200),
+                CGPoint::new(30.0, 10.0),
+                RemotePointerButton::Left,
+            ),
+            1
+        );
+        assert_eq!(
+            next_click_count(
+                Some(&last),
+                start + Duration::from_millis(200),
+                point,
+                RemotePointerButton::Right,
+            ),
+            1
         );
     }
 

@@ -8,7 +8,8 @@ use image::codecs::png::{CompressionType, FilterType, PngEncoder};
 use image::{ColorType, ImageEncoder, ImageFormat};
 use p2p_core::remote_desktop::{
     RemoteDesktopConfig, RemoteDesktopFrame, RemoteDesktopFrameHeader, RemoteDesktopOffer,
-    RemoteDesktopPatch, RemoteDisplay, RemoteInputEvent, REMOTE_DESKTOP_STREAM_TYPE,
+    RemoteDesktopPatch, RemoteDisplay, RemoteInputEvent, MAX_DESKTOP_FPS, MAX_DESKTOP_HEIGHT,
+    MAX_DESKTOP_WIDTH, REMOTE_DESKTOP_STREAM_TYPE,
 };
 use p2p_core::ChatSessionHandle;
 
@@ -73,13 +74,6 @@ pub struct RawFrame {
     pub rgba: Vec<u8>,
 }
 
-#[derive(Debug, Clone)]
-pub struct DecodedFrame {
-    pub width: u32,
-    pub height: u32,
-    pub rgba: Vec<u8>,
-}
-
 #[derive(Debug)]
 pub enum CaptureEvent {
     Error(String),
@@ -106,13 +100,13 @@ pub fn fit_dimensions(source_width: u32, source_height: u32) -> RemoteDesktopCon
     if source_width == 0 || source_height == 0 {
         return RemoteDesktopConfig::default();
     }
-    let scale = (1280.0_f64 / source_width as f64)
-        .min(720.0_f64 / source_height as f64)
+    let scale = (MAX_DESKTOP_WIDTH as f64 / source_width as f64)
+        .min(MAX_DESKTOP_HEIGHT as f64 / source_height as f64)
         .min(1.0);
     RemoteDesktopConfig {
         width: ((source_width as f64 * scale).round() as u32).max(1),
         height: ((source_height as f64 * scale).round() as u32).max(1),
-        max_fps: 15,
+        max_fps: MAX_DESKTOP_FPS,
     }
 }
 
@@ -183,8 +177,8 @@ fn capture_loop(
             Ok(Some(frame)) => {
                 consecutive_failures = 0;
                 if let Some(encoded) = encoder.encode(&frame)? {
-                    if !handle.try_send_remote_desktop_frame(encoded)? {
-                        encoder.force_keyframe();
+                    if handle.try_send_remote_desktop_frame(encoded)? {
+                        encoder.commit(&frame);
                     }
                 }
             }
@@ -231,7 +225,7 @@ impl FrameDecoder {
         }
     }
 
-    pub fn apply(&mut self, frame: RemoteDesktopFrame) -> Result<DecodedFrame> {
+    pub fn apply(&mut self, frame: RemoteDesktopFrame) -> Result<()> {
         frame.validate()?;
         let header = &frame.header;
         if header.session_id != self.session_id {
@@ -239,6 +233,11 @@ impl FrameDecoder {
         }
         if header.frame_id <= self.last_frame_id {
             anyhow::bail!("远程桌面帧序号未递增")
+        }
+        // 增量帧依赖前一帧的画布内容，跳号意味着中间帧已丢失，
+        // 直接应用会造成无声的画面损坏，只能通过关键帧恢复
+        if !header.keyframe && self.ready && header.frame_id != self.last_frame_id + 1 {
+            anyhow::bail!("远程桌面增量帧不连续")
         }
         if (header.width != self.width || header.height != self.height) && !header.keyframe {
             anyhow::bail!("远程桌面尺寸变化缺少关键帧")
@@ -266,11 +265,15 @@ impl FrameDecoder {
         }
         self.last_frame_id = header.frame_id;
         self.ready = true;
-        Ok(DecodedFrame {
-            width: self.width,
-            height: self.height,
-            rgba: self.rgba.clone(),
-        })
+        Ok(())
+    }
+
+    pub fn size(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    pub fn canvas(&self) -> &[u8] {
+        &self.rgba
     }
 }
 
@@ -316,6 +319,8 @@ impl FrameEncoder {
         self.force_keyframe = true;
     }
 
+    /// 只计算差分并编码，不修改基准帧；帧真正入队后必须调用 [`Self::commit`]。
+    /// 被丢弃的帧不提交，下一帧的差分会自然覆盖累积变化，避免每次丢帧都强制全量关键帧
     fn encode(&mut self, frame: &RawFrame) -> Result<Option<RemoteDesktopFrame>> {
         let expected = (frame.width * frame.height * 4) as usize;
         if frame.rgba.len() != expected {
@@ -325,11 +330,6 @@ impl FrameEncoder {
             || self.width != frame.width
             || self.height != frame.height
             || self.previous.len() != frame.rgba.len();
-        if keyframe {
-            self.width = frame.width;
-            self.height = frame.height;
-            self.previous = vec![0; expected];
-        }
 
         let mut patches = Vec::new();
         let mut payload = Vec::new();
@@ -366,14 +366,11 @@ impl FrameEncoder {
             return Ok(None);
         }
 
-        self.frame_id += 1;
-        self.previous.copy_from_slice(&frame.rgba);
-        self.force_keyframe = false;
         let result = RemoteDesktopFrame {
             header: RemoteDesktopFrameHeader {
                 stream_type: REMOTE_DESKTOP_STREAM_TYPE.into(),
                 session_id: self.session_id.clone(),
-                frame_id: self.frame_id,
+                frame_id: self.frame_id + 1,
                 width: frame.width,
                 height: frame.height,
                 keyframe,
@@ -383,6 +380,18 @@ impl FrameEncoder {
         };
         result.validate()?;
         Ok(Some(result))
+    }
+
+    fn commit(&mut self, frame: &RawFrame) {
+        self.width = frame.width;
+        self.height = frame.height;
+        self.frame_id += 1;
+        if self.previous.len() == frame.rgba.len() {
+            self.previous.copy_from_slice(&frame.rgba);
+        } else {
+            self.previous = frame.rgba.clone();
+        }
+        self.force_keyframe = false;
     }
 }
 
@@ -466,15 +475,77 @@ mod tests {
             rgba: vec![10; 160 * 90 * 4],
         };
         let first = encoder.encode(&raw).unwrap().unwrap();
+        encoder.commit(&raw);
         assert!(first.header.keyframe);
-        assert_eq!(decoder.apply(first).unwrap().rgba, raw.rgba);
+        decoder.apply(first).unwrap();
+        assert_eq!(decoder.canvas(), raw.rgba);
 
         raw.rgba[0] = 20;
         let second = encoder.encode(&raw).unwrap().unwrap();
+        encoder.commit(&raw);
         assert!(!second.header.keyframe);
         assert_eq!(second.header.patches.len(), 1);
-        assert_eq!(decoder.apply(second).unwrap().rgba, raw.rgba);
+        decoder.apply(second).unwrap();
+        assert_eq!(decoder.canvas(), raw.rgba);
+        assert_eq!(decoder.size(), (160, 90));
         assert!(encoder.encode(&raw).unwrap().is_none());
+    }
+
+    #[test]
+    fn uncommitted_frame_accumulates_into_next_delta() {
+        let mut encoder = FrameEncoder::new("desktop-1".into());
+        let mut raw = RawFrame {
+            width: 160,
+            height: 90,
+            rgba: vec![10; 160 * 90 * 4],
+        };
+        let first = encoder.encode(&raw).unwrap().unwrap();
+        assert!(first.header.keyframe);
+        encoder.commit(&raw);
+
+        // 第一个增量帧被丢弃（未 commit），左上角的变化必须保留在下一帧里
+        raw.rgba[0] = 20;
+        let dropped = encoder.encode(&raw).unwrap().unwrap();
+        // 再改动另一个 tile（x=128 起第二列）
+        let offset = (128 * 4) as usize;
+        raw.rgba[offset] = 30;
+        let retried = encoder.encode(&raw).unwrap().unwrap();
+        assert_eq!(retried.header.frame_id, dropped.header.frame_id);
+        assert!(!retried.header.keyframe);
+        assert_eq!(retried.header.patches.len(), 2);
+    }
+
+    #[test]
+    fn decoder_rejects_delta_gap_and_recovers_with_keyframe() {
+        let mut encoder = FrameEncoder::new("desktop-1".into());
+        let mut decoder = FrameDecoder::new("desktop-1".into());
+        let mut raw = RawFrame {
+            width: 160,
+            height: 90,
+            rgba: vec![10; 160 * 90 * 4],
+        };
+        let first = encoder.encode(&raw).unwrap().unwrap();
+        encoder.commit(&raw);
+        decoder.apply(first).unwrap();
+
+        raw.rgba[0] = 20;
+        let second = encoder.encode(&raw).unwrap().unwrap();
+        encoder.commit(&raw);
+        raw.rgba[0] = 30;
+        let third = encoder.encode(&raw).unwrap().unwrap();
+        encoder.commit(&raw);
+
+        // 丢失第二帧后第三帧不能直接应用
+        drop(second);
+        assert!(decoder.apply(third).is_err());
+
+        // 关键帧可以从任意序号恢复
+        encoder.force_keyframe();
+        let recovery = encoder.encode(&raw).unwrap().unwrap();
+        encoder.commit(&raw);
+        assert!(recovery.header.keyframe);
+        decoder.apply(recovery).unwrap();
+        assert_eq!(decoder.canvas(), raw.rgba);
     }
 
     #[test]

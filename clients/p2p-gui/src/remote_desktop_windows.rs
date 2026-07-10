@@ -110,7 +110,6 @@ pub struct Capture {
     staging: Option<ID3D11Texture2D>,
     staging_width: u32,
     staging_height: u32,
-    bounds: RECT,
     config: RemoteDesktopConfig,
 }
 
@@ -148,7 +147,6 @@ impl Capture {
             staging: None,
             staging_width: 0,
             staging_height: 0,
-            bounds: entry.desc.DesktopCoordinates,
             config,
         })
     }
@@ -224,8 +222,9 @@ impl Capture {
             )
         };
         if frame_info.PointerPosition.Visible.as_bool() {
-            let x = frame_info.PointerPosition.Position.x - self.bounds.left;
-            let y = frame_info.PointerPosition.Position.y - self.bounds.top;
+            // DXGI 指针坐标本就相对当前输出左上角，无需再按显示器边界平移
+            let x = frame_info.PointerPosition.Position.x;
+            let y = frame_info.PointerPosition.Position.y;
             if x >= 0 && y >= 0 && x < desc.Width as i32 && y < desc.Height as i32 {
                 let scaled_x = x as u32 * self.config.width / desc.Width.max(1);
                 let scaled_y = y as u32 * self.config.height / desc.Height.max(1);
@@ -292,10 +291,42 @@ fn draw_pointer_marker(image: &mut RgbaImage, x: u32, y: u32) {
     }
 }
 
+/// viewer 发来的滚轮增量是 egui 点单位，一个滚轮格通常为 3 行 × 50pt
+const WHEEL_POINTS_PER_NOTCH: f64 = 150.0;
+const WHEEL_NOTCH: f64 = 120.0;
+
+#[derive(Debug, Default)]
+struct WheelAccumulator {
+    vertical: f64,
+    horizontal: f64,
+}
+
+impl WheelAccumulator {
+    /// 把点单位增量换算成 WHEEL_DELTA 并累积，凑满整格才返回（余数保留），
+    /// 因为很多 Win32 应用会忽略不足 120 的滚轮增量
+    fn push(&mut self, horizontal: bool, delta: i32) -> i32 {
+        let accum = if horizontal {
+            &mut self.horizontal
+        } else {
+            &mut self.vertical
+        };
+        *accum += delta as f64 * WHEEL_NOTCH / WHEEL_POINTS_PER_NOTCH;
+        let ticks = (*accum / WHEEL_NOTCH).trunc();
+        *accum -= ticks * WHEEL_NOTCH;
+        (ticks * WHEEL_NOTCH) as i32
+    }
+
+    fn reset(&mut self) {
+        self.vertical = 0.0;
+        self.horizontal = 0.0;
+    }
+}
+
 pub struct InputInjector {
     bounds: RECT,
     pressed_keys: HashSet<(u16, bool)>,
     pressed_buttons: HashSet<RemotePointerButton>,
+    wheel: WheelAccumulator,
 }
 
 impl InputInjector {
@@ -309,6 +340,7 @@ impl InputInjector {
             bounds,
             pressed_keys: HashSet::new(),
             pressed_buttons: HashSet::new(),
+            wheel: WheelAccumulator::default(),
         })
     }
 
@@ -319,12 +351,16 @@ impl InputInjector {
                 self.pointer_button(*button, *pressed)
             }
             RemoteInputEvent::Wheel { horizontal, delta } => {
+                let amount = self.wheel.push(*horizontal, *delta);
+                if amount == 0 {
+                    return Ok(());
+                }
                 let flags = if *horizontal {
                     MOUSEEVENTF_HWHEEL
                 } else {
                     MOUSEEVENTF_WHEEL
                 };
-                send_inputs(&[mouse_input(0, 0, *delta as u32, flags)])
+                send_inputs(&[mouse_input(0, 0, amount as u32, flags)])
             }
             RemoteInputEvent::Key {
                 scan_code,
@@ -405,6 +441,7 @@ impl InputInjector {
     }
 
     fn release_all(&mut self) -> Result<()> {
+        self.wheel.reset();
         let keys = self.pressed_keys.drain().collect::<Vec<_>>();
         let buttons = self.pressed_buttons.drain().collect::<Vec<_>>();
         for (scan_code, extended) in keys {
@@ -462,6 +499,24 @@ fn send_inputs(inputs: &[INPUT]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wheel_accumulator_emits_whole_notches() {
+        let mut wheel = WheelAccumulator::default();
+        // 一格 150pt → 恰好 120
+        assert_eq!(wheel.push(false, 150), 120);
+        // 不足一格先积累，凑满再发
+        assert_eq!(wheel.push(false, 100), 0);
+        assert_eq!(wheel.push(false, 100), 120);
+        // 反向滚动清掉余数后同样按整格发
+        let mut wheel = WheelAccumulator::default();
+        assert_eq!(wheel.push(false, -300), -240);
+        // 横向与纵向互不影响
+        assert_eq!(wheel.push(true, 150), 120);
+        assert_eq!(wheel.push(false, 75), 0);
+        wheel.reset();
+        assert_eq!(wheel.push(false, 75), 0);
+    }
 
     #[test]
     #[ignore = "requires an interactive Windows desktop"]

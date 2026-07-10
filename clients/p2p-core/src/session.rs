@@ -1798,7 +1798,14 @@ async fn receive_remote_desktop_frame(
         let mut slot = desktop_frame_slot
             .lock()
             .map_err(|_| anyhow::anyhow!("远程桌面帧槽已损坏"))?;
-        *slot = Some(frame);
+        // 并发流可能乱序完成：只允许更新的帧覆盖同会话的旧帧，换会话则直接替换
+        let replace = slot.as_ref().is_none_or(|existing| {
+            existing.header.session_id != frame.header.session_id
+                || existing.header.frame_id < frame.header.frame_id
+        });
+        if replace {
+            *slot = Some(frame);
+        }
     }
     let _ = event_tx.try_send(SessionEvent::RemoteDesktop(
         RemoteDesktopEvent::FrameAvailable {
