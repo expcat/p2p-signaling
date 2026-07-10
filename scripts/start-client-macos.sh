@@ -51,14 +51,12 @@ EOF
   esac
 done
 
-cd "${CLIENT_DIR}"
-
 if [[ "${MODE}" == "release" ]]; then
-  cargo build --release -p p2p-gui
-  BINARY="${CLIENT_DIR}/target/release/p2p-gui"
+  "${SCRIPT_DIR}/build-client-macos.sh" --release
+  BINARY="${CLIENT_DIR}/target/release/P2P Signaling.app/Contents/MacOS/p2p-gui"
 else
-  cargo build -p p2p-gui
-  BINARY="${CLIENT_DIR}/target/debug/p2p-gui"
+  "${SCRIPT_DIR}/build-client-macos.sh" --debug
+  BINARY="${CLIENT_DIR}/target/debug/P2P Signaling.app/Contents/MacOS/p2p-gui"
 fi
 
 ARGS=(--server "${SERVER}" --role "${ROLE}")

@@ -119,7 +119,7 @@ pub async fn prepare_connect_info(role: SignalingRole) -> Result<PreparedConnect
 }
 
 fn local_capabilities() -> Vec<String> {
-    if cfg!(target_os = "windows") {
+    if crate::remote_desktop::RemoteDesktopPlatform::current().is_some() {
         vec![crate::remote_desktop::REMOTE_DESKTOP_CAPABILITY.to_string()]
     } else {
         Vec::new()

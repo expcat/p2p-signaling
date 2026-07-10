@@ -19,8 +19,8 @@ use p2p_core::{
     SessionRole,
 };
 use p2p_core::{
-    RemoteDesktopEvent, RemoteDesktopOffer, RemoteDesktopState, RemoteDisplay, RemoteInputEvent,
-    RemotePointerButton,
+    RemoteDesktopEvent, RemoteDesktopOffer, RemoteDesktopPlatform, RemoteDesktopState,
+    RemoteDisplay, RemoteInputEvent, RemotePointerButton,
 };
 
 mod remote_desktop;
@@ -641,6 +641,18 @@ impl P2pChatApp {
             self.push_system("已有远程桌面会话。");
             return;
         }
+        if let Err(error) = remote_desktop::ensure_screen_capture_permission() {
+            self.push_system(format!("无法共享屏幕：{error:#}"));
+            return;
+        }
+        if self.remote_allow_control {
+            if let Err(error) = remote_desktop::ensure_input_permission() {
+                self.push_system(format!(
+                    "无法授予远程控制：{error:#}；可关闭控制权限后仅共享画面。"
+                ));
+                return;
+            }
+        }
         let Some(display) = self.remote_displays.get(self.remote_display_index).cloned() else {
             self.push_system("没有可共享的显示器。");
             return;
@@ -691,6 +703,28 @@ impl P2pChatApp {
         let Some(handle) = self.handle.clone() else {
             return;
         };
+        if allow_control && self.input_injector.is_none() {
+            let Some(display_id) = self
+                .remote_offer
+                .as_ref()
+                .map(|offer| offer.display.id.clone())
+            else {
+                self.push_system("找不到当前共享的显示器。");
+                return;
+            };
+            match InputInjector::new(&display_id) {
+                Ok(injector) => self.input_injector = Some(injector),
+                Err(error) => {
+                    self.push_system(format!("无法启用远程控制：{error:#}"));
+                    return;
+                }
+            }
+        } else if !allow_control {
+            if let Some(injector) = self.input_injector.as_mut() {
+                let _ = injector.inject(&RemoteInputEvent::ReleaseAll);
+            }
+            self.input_injector = None;
+        }
         let session_id = session_id.clone();
         let notifier = self.notifier.clone();
         self.runtime.spawn(async move {
@@ -747,7 +781,7 @@ impl P2pChatApp {
             RemoteDesktopEvent::PeerAvailabilityChanged(supported) => {
                 self.remote_peer_supported = supported;
                 if supported {
-                    self.push_system("对方支持 Windows 远程桌面。");
+                    self.push_system("对方支持远程桌面。");
                 }
             }
             RemoteDesktopEvent::IncomingOffer(offer) => {
@@ -783,11 +817,15 @@ impl P2pChatApp {
                 self.consume_remote_frame(&session_id);
             }
             RemoteDesktopEvent::Input(event) => {
-                if let Some(injector) = self.input_injector.as_mut() {
-                    if let Err(error) = injector.inject(&event) {
-                        self.status = format!("远程输入失败：{error:#}");
-                        self.push_system(self.status.clone());
-                    }
+                let error = self
+                    .input_injector
+                    .as_mut()
+                    .and_then(|injector| injector.inject(&event).err());
+                if let Some(error) = error {
+                    self.status = format!("远程输入失败：{error:#}");
+                    self.push_system(self.status.clone());
+                    self.input_injector = None;
+                    self.update_remote_control_permission(false);
                 }
             }
             RemoteDesktopEvent::KeyframeRequested(_) => {
@@ -807,11 +845,21 @@ impl P2pChatApp {
         let Some(handle) = self.handle.clone() else {
             return;
         };
-        match InputInjector::new(&offer.display.id) {
-            Ok(injector) => self.input_injector = Some(injector),
-            Err(error) => {
-                self.push_system(format!("初始化远程输入失败：{error:#}"));
-                self.input_injector = None;
+        self.remote_offer = Some(offer.clone());
+        if offer.allow_control {
+            match InputInjector::new(&offer.display.id) {
+                Ok(injector) => self.input_injector = Some(injector),
+                Err(error) => {
+                    self.push_system(format!("初始化远程输入失败：{error:#}"));
+                    self.input_injector = None;
+                    let session_id = offer.session_id.clone();
+                    let permission_handle = handle.clone();
+                    self.runtime.spawn(async move {
+                        let _ = permission_handle
+                            .set_remote_desktop_permission(session_id, false)
+                            .await;
+                    });
+                }
             }
         }
         self.capture_worker = Some(CaptureWorker::start(
@@ -1067,8 +1115,20 @@ impl P2pChatApp {
         self.send_remote_modifier_changes(modifiers);
         for event in events {
             match event {
+                egui::Event::Copy => {
+                    self.send_remote_shortcut_key(egui::Key::C);
+                }
+                egui::Event::Cut => {
+                    self.send_remote_shortcut_key(egui::Key::X);
+                }
+                egui::Event::Paste(_) => {
+                    self.send_remote_shortcut_key(egui::Key::V);
+                }
                 egui::Event::Text(text)
-                    if !text.is_empty() && !modifiers.ctrl && !modifiers.alt =>
+                    if !text.is_empty()
+                        && !modifiers.command
+                        && !modifiers.ctrl
+                        && !modifiers.alt =>
                 {
                     self.send_remote_input_event(RemoteInputEvent::Text { text });
                 }
@@ -1079,7 +1139,7 @@ impl P2pChatApp {
                     ..
                 } if key != egui::Key::Escape && (!repeat || !pressed) => {
                     if let Some((scan_code, extended, printable)) = egui_key_to_scan_code(key) {
-                        if !printable || modifiers.ctrl || modifiers.alt {
+                        if !printable || modifiers.command || modifiers.ctrl || modifiers.alt {
                             self.send_remote_input_event(RemoteInputEvent::Key {
                                 scan_code,
                                 extended,
@@ -1093,12 +1153,25 @@ impl P2pChatApp {
         }
     }
 
+    fn send_remote_shortcut_key(&mut self, key: egui::Key) {
+        if let Some((scan_code, extended, _)) = egui_key_to_scan_code(key) {
+            self.send_remote_input_event(RemoteInputEvent::Key {
+                scan_code,
+                extended,
+                pressed: true,
+            });
+        }
+    }
+
     fn send_remote_modifier_changes(&mut self, next: egui::Modifiers) {
-        for (was, is, scan_code, extended) in [
-            (self.remote_modifiers.ctrl, next.ctrl, 0x1D, false),
-            (self.remote_modifiers.shift, next.shift, 0x2A, false),
-            (self.remote_modifiers.alt, next.alt, 0x38, false),
-        ] {
+        let platform = self
+            .remote_offer
+            .as_ref()
+            .map(|offer| offer.platform)
+            .unwrap_or(RemoteDesktopPlatform::Windows);
+        for (was, is, scan_code, extended) in
+            remote_modifier_changes(self.remote_modifiers, next, platform)
+        {
             if was != is {
                 self.send_remote_input_event(RemoteInputEvent::Key {
                     scan_code,
@@ -2211,6 +2284,40 @@ fn egui_key_to_scan_code(key: egui::Key) -> Option<(u16, bool, bool)> {
     Some(value)
 }
 
+fn remote_modifier_changes(
+    previous: egui::Modifiers,
+    next: egui::Modifiers,
+    platform: RemoteDesktopPlatform,
+) -> Vec<(bool, bool, u16, bool)> {
+    let mut changes = vec![
+        (previous.shift, next.shift, 0x2A, false),
+        (previous.alt, next.alt, 0x38, false),
+    ];
+    match platform {
+        RemoteDesktopPlatform::Windows => {
+            changes.push((
+                previous.command || previous.ctrl,
+                next.command || next.ctrl,
+                0x1D,
+                false,
+            ));
+        }
+        RemoteDesktopPlatform::Macos if cfg!(target_os = "macos") => {
+            changes.push((previous.ctrl, next.ctrl, 0x1D, false));
+            changes.push((previous.mac_cmd, next.mac_cmd, 0x5B, true));
+        }
+        RemoteDesktopPlatform::Macos => {
+            changes.push((
+                previous.command || previous.ctrl,
+                next.command || next.ctrl,
+                0x5B,
+                true,
+            ));
+        }
+    }
+    changes
+}
+
 fn state_after_connected_event(state: ConnectionState) -> ConnectionState {
     match state {
         ConnectionState::Connecting => ConnectionState::Connected,
@@ -2390,5 +2497,34 @@ mod tests {
         assert_eq!(finite_width(f32::NAN, 120.0), 120.0);
         assert_eq!(row_text_width(f32::INFINITY), 120.0);
         assert_eq!(row_text_width(420.0), 236.0);
+    }
+
+    #[test]
+    fn maps_primary_shortcut_to_windows_control() {
+        let next = egui::Modifiers {
+            command: true,
+            ..egui::Modifiers::NONE
+        };
+        assert!(remote_modifier_changes(
+            egui::Modifiers::NONE,
+            next,
+            RemoteDesktopPlatform::Windows
+        )
+        .contains(&(false, true, 0x1D, false)));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn keeps_macos_control_and_command_distinct() {
+        let next = egui::Modifiers {
+            ctrl: true,
+            mac_cmd: true,
+            command: true,
+            ..egui::Modifiers::NONE
+        };
+        let changes =
+            remote_modifier_changes(egui::Modifiers::NONE, next, RemoteDesktopPlatform::Macos);
+        assert!(changes.contains(&(false, true, 0x1D, false)));
+        assert!(changes.contains(&(false, true, 0x5B, true)));
     }
 }

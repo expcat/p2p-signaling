@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, Mutex};
 
@@ -2118,6 +2118,8 @@ impl ChatSessionHandle {
         self.direct_tx
             .send(DirectCommand::OfferRemoteDesktop(RemoteDesktopOffer {
                 session_id: session_id.clone(),
+                platform: crate::remote_desktop::RemoteDesktopPlatform::current()
+                    .context("当前平台不支持远程桌面")?,
                 display,
                 config,
                 allow_control,

@@ -25,3 +25,48 @@ windows = { version = "0.62.2", features = [
   "Win32_UI_Input_KeyboardAndMouse",
   "Win32_UI_WindowsAndMessaging",
 ] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = { version = "0.6.2", default-features = false, features = ["alloc"] }
+dispatch2 = { version = "0.3.1", default-features = false, features = ["alloc", "objc2"] }
+objc2 = { version = "0.6.4", default-features = false, features = ["std"] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = [
+  "CFCGTypes",
+  "objc2",
+] }
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = [
+  "CGDirectDisplay",
+  "CGError",
+  "CGEvent",
+  "CGEventTypes",
+  "CGRemoteOperation",
+  "CGWindow",
+] }
+objc2-core-media = { version = "0.3.2", default-features = false, features = [
+  "CMSampleBuffer",
+  "CMTime",
+  "objc2",
+  "objc2-core-video",
+] }
+objc2-core-video = { version = "0.3.2", default-features = false, features = [
+  "CVBase",
+  "CVBuffer",
+  "CVImageBuffer",
+  "CVReturn",
+] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
+  "NSArray",
+  "NSError",
+  "NSObject",
+  "NSString",
+  "std",
+] }
+objc2-screen-capture-kit = { version = "0.3.2", default-features = false, features = [
+  "SCShareableContent",
+  "SCStream",
+  "block2",
+  "dispatch2",
+  "objc2-core-graphics",
+  "objc2-core-media",
+  "std",
+] }

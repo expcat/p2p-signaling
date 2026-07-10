@@ -18,6 +18,26 @@ pub struct RemoteDisplay {
     pub height: u32,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "kebab-case")]
+pub enum RemoteDesktopPlatform {
+    #[default]
+    Windows,
+    Macos,
+}
+
+impl RemoteDesktopPlatform {
+    pub const fn current() -> Option<Self> {
+        if cfg!(target_os = "windows") {
+            Some(Self::Windows)
+        } else if cfg!(target_os = "macos") {
+            Some(Self::Macos)
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteDesktopConfig {
@@ -56,6 +76,8 @@ impl RemoteDesktopConfig {
 #[serde(rename_all = "camelCase")]
 pub struct RemoteDesktopOffer {
     pub session_id: String,
+    #[serde(default)]
+    pub platform: RemoteDesktopPlatform,
     pub display: RemoteDisplay,
     pub config: RemoteDesktopConfig,
     pub allow_control: bool,
@@ -302,5 +324,48 @@ mod tests {
         }
         .validate()
         .is_err());
+    }
+
+    #[test]
+    fn old_offer_defaults_to_windows_platform() {
+        let offer: RemoteDesktopOffer = serde_json::from_value(serde_json::json!({
+            "sessionId": "desktop-1",
+            "display": {
+                "id": "display-1",
+                "name": "Display 1",
+                "width": 1920,
+                "height": 1080
+            },
+            "config": {
+                "width": 1280,
+                "height": 720,
+                "maxFps": 15
+            },
+            "allowControl": false
+        }))
+        .unwrap();
+        assert_eq!(offer.platform, RemoteDesktopPlatform::Windows);
+    }
+
+    #[test]
+    fn macos_offer_serializes_platform() {
+        let offer = RemoteDesktopOffer {
+            session_id: "desktop-1".into(),
+            platform: RemoteDesktopPlatform::Macos,
+            display: RemoteDisplay {
+                id: "42".into(),
+                name: "Main Display".into(),
+                width: 1920,
+                height: 1080,
+            },
+            config: RemoteDesktopConfig::default(),
+            allow_control: true,
+        };
+        let value = serde_json::to_value(&offer).unwrap();
+        assert_eq!(value["platform"], "macos");
+        assert_eq!(
+            serde_json::from_value::<RemoteDesktopOffer>(value).unwrap(),
+            offer
+        );
     }
 }

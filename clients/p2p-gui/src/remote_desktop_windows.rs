@@ -34,6 +34,14 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use super::RawFrame;
 
+pub fn ensure_screen_capture_permission() -> Result<()> {
+    Ok(())
+}
+
+pub fn ensure_input_permission() -> Result<()> {
+    Ok(())
+}
+
 struct OutputEntry {
     id: String,
     adapter: IDXGIAdapter1,

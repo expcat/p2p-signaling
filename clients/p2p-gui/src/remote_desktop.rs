@@ -16,7 +16,11 @@ use p2p_core::ChatSessionHandle;
 #[path = "remote_desktop_windows.rs"]
 mod platform;
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+#[path = "remote_desktop_macos.rs"]
+mod platform;
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 mod platform {
     use anyhow::Result;
     use p2p_core::remote_desktop::{RemoteDesktopConfig, RemoteDisplay, RemoteInputEvent};
@@ -25,6 +29,14 @@ mod platform {
 
     pub fn available_displays() -> Result<Vec<RemoteDisplay>> {
         Ok(Vec::new())
+    }
+
+    pub fn ensure_screen_capture_permission() -> Result<()> {
+        anyhow::bail!("当前平台暂不支持远程桌面")
+    }
+
+    pub fn ensure_input_permission() -> Result<()> {
+        anyhow::bail!("当前平台暂不支持远程控制")
     }
 
     pub struct Capture;
@@ -75,11 +87,19 @@ pub enum CaptureEvent {
 }
 
 pub fn is_supported() -> bool {
-    cfg!(target_os = "windows")
+    cfg!(any(target_os = "windows", target_os = "macos"))
 }
 
 pub fn available_displays() -> Result<Vec<RemoteDisplay>> {
     platform::available_displays()
+}
+
+pub fn ensure_screen_capture_permission() -> Result<()> {
+    platform::ensure_screen_capture_permission()
+}
+
+pub fn ensure_input_permission() -> Result<()> {
+    platform::ensure_input_permission()
 }
 
 pub fn fit_dimensions(source_width: u32, source_height: u32) -> RemoteDesktopConfig {
