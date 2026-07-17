@@ -41,7 +41,7 @@ fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([920.0, 640.0])
-            .with_min_inner_size([760.0, 520.0]),
+            .with_min_inner_size([880.0, 600.0]),
         ..Default::default()
     };
 
@@ -606,6 +606,7 @@ impl P2pChatApp {
         self.event_rx = None;
         self.active_room = None;
         self.state = ConnectionState::Idle;
+        self.main_view = MainView::Chat;
     }
 
     fn disconnect(&mut self) {
@@ -958,29 +959,107 @@ impl P2pChatApp {
         let state = self.remote_state.clone();
         match state {
             RemoteDesktopState::Idle => {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(80.0);
-                    ui.heading("远程桌面未启动");
-                    ui.label("直连建立后，可从左侧选择显示器并发起共享。");
-                });
+                if !remote_desktop::is_supported() {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(64.0);
+                        ui.heading("当前平台暂不支持远程桌面");
+                        ui.label("聊天与文件传输仍可正常使用。");
+                    });
+                    return;
+                }
+
+                ui.add_space(18.0);
+                ui.heading("开始远程桌面共享");
+                ui.label(
+                    RichText::new("选择要共享的显示器，并决定是否允许对方临时控制。")
+                        .color(Color32::from_rgb(155, 169, 188)),
+                );
+                ui.add_space(18.0);
+
+                Frame::new()
+                    .fill(Color32::from_rgb(14, 25, 40))
+                    .corner_radius(CornerRadius::same(10))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(42, 60, 82)))
+                    .inner_margin(egui::Margin::symmetric(18, 16))
+                    .show(ui, |ui| {
+                        ui.label(RichText::new("共享设置").strong().size(16.0));
+                        ui.add_space(8.0);
+                        ui.label("显示器");
+                        let selected_name = self
+                            .remote_displays
+                            .get(self.remote_display_index)
+                            .map(|display| display.name.clone())
+                            .unwrap_or_else(|| "无可用显示器".into());
+                        egui::ComboBox::from_id_salt("remote-display")
+                            .selected_text(selected_name)
+                            .width(ui.available_width())
+                            .show_ui(ui, |ui| {
+                                for (index, display) in self.remote_displays.iter().enumerate() {
+                                    ui.selectable_value(
+                                        &mut self.remote_display_index,
+                                        index,
+                                        format!(
+                                            "{} ({}×{})",
+                                            display.name, display.width, display.height
+                                        ),
+                                    );
+                                }
+                            });
+                        if ui.small_button("刷新显示器列表").clicked() {
+                            self.refresh_remote_displays();
+                        }
+                        ui.add_space(8.0);
+                        ui.checkbox(&mut self.remote_allow_control, "允许对方临时控制");
+                        ui.label(
+                            RichText::new("停止共享或直连断开时，临时控制权限会立即撤销。")
+                                .small()
+                                .color(Color32::from_rgb(132, 148, 169)),
+                        );
+                        ui.add_space(12.0);
+
+                        let can_share = self.state == ConnectionState::Direct
+                            && self.remote_peer_supported
+                            && !self.remote_displays.is_empty();
+                        if primary_button(ui, can_share, "共享屏幕", 40.0).clicked() {
+                            self.start_remote_desktop_offer();
+                        }
+
+                        if self.state != ConnectionState::Direct {
+                            ui.label(
+                                RichText::new("直连建立后即可发起共享。")
+                                    .small()
+                                    .color(Color32::from_rgb(132, 148, 169)),
+                            );
+                        } else if !self.remote_peer_supported {
+                            ui.label(
+                                RichText::new("对方客户端暂不支持远程桌面。")
+                                    .small()
+                                    .color(Color32::from_rgb(205, 151, 83)),
+                            );
+                        }
+                    });
             }
             RemoteDesktopState::OutgoingPending(offer) => {
                 ui.vertical_centered(|ui| {
-                    ui.add_space(80.0);
+                    ui.add_space(70.0);
                     ui.spinner();
                     ui.heading("等待对方接受共享");
                     ui.label(format!(
                         "{} · {}×{}",
                         offer.display.name, offer.config.width, offer.config.height
                     ));
+                    ui.add_space(16.0);
+                    if ui.button("取消共享请求").clicked() {
+                        self.stop_remote_desktop("用户取消远程桌面请求");
+                    }
                 });
             }
             RemoteDesktopState::IncomingPending(offer) => {
                 Frame::new()
-                    .fill(Color32::from_rgb(18, 24, 33))
-                    .corner_radius(CornerRadius::same(8))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(55, 78, 103)))
-                    .inner_margin(egui::Margin::symmetric(18, 16))
+                    .fill(Color32::from_rgb(14, 25, 40))
+                    .corner_radius(CornerRadius::same(10))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(55, 92, 132)))
+                    .inner_margin(egui::Margin::symmetric(20, 18))
                     .show(ui, |ui| {
                         ui.heading("对方请求共享屏幕");
                         ui.label(format!(
@@ -1008,7 +1087,7 @@ impl P2pChatApp {
             }
             RemoteDesktopState::Sharing { allow_control, .. } => {
                 ui.vertical_centered(|ui| {
-                    ui.add_space(80.0);
+                    ui.add_space(64.0);
                     ui.heading("正在共享本机屏幕");
                     ui.label(if allow_control {
                         "对方已获本次会话临时控制权限"
@@ -1016,6 +1095,14 @@ impl P2pChatApp {
                         "对方只能观看；可在左侧随时开启控制"
                     });
                     ui.label("停止共享或直连断开时，授权会立即撤销。");
+                    ui.add_space(16.0);
+                    let mut next = allow_control;
+                    if ui.checkbox(&mut next, "允许对方临时控制").changed() {
+                        self.update_remote_control_permission(next);
+                    }
+                    if ui.button("停止远程桌面").clicked() {
+                        self.stop_remote_desktop("用户停止远程桌面");
+                    }
                 });
             }
             RemoteDesktopState::Viewing {
@@ -1024,37 +1111,89 @@ impl P2pChatApp {
             } => {
                 let Some(texture_id) = self.remote_texture.as_ref().map(TextureHandle::id) else {
                     ui.vertical_centered(|ui| {
-                        ui.add_space(80.0);
+                        ui.add_space(64.0);
                         ui.spinner();
                         ui.heading("等待远程画面");
                     });
                     return;
                 };
+
+                let mut send_esc = false;
+                let mut stop_remote = false;
+                Frame::new()
+                    .fill(Color32::from_rgb(14, 25, 40))
+                    .corner_radius(CornerRadius::same(8))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(42, 60, 82)))
+                    .inner_margin(egui::Margin::symmetric(12, 10))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(if can_control {
+                                    if self.remote_keyboard_captured {
+                                        "控制已启用 · 按 Esc 释放键盘"
+                                    } else {
+                                        "控制已授权 · 点击画面接管键盘"
+                                    }
+                                } else {
+                                    "仅观看"
+                                })
+                                .strong()
+                                .color(if can_control {
+                                    Color32::from_rgb(104, 203, 148)
+                                } else {
+                                    Color32::from_rgb(180, 192, 207)
+                                }),
+                            );
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui
+                                    .add(
+                                        egui::Button::new("停止远程桌面")
+                                            .fill(Color32::from_rgb(112, 42, 46)),
+                                    )
+                                    .clicked()
+                                {
+                                    stop_remote = true;
+                                }
+                                if can_control && ui.button("发送 Esc").clicked() {
+                                    send_esc = true;
+                                }
+                            });
+                        });
+                    });
+                if send_esc {
+                    self.send_remote_esc();
+                }
+                if stop_remote {
+                    self.stop_remote_desktop("用户停止远程桌面");
+                    return;
+                }
+                ui.label(
+                    RichText::new("Esc 仅释放本地键盘控制；共享停止或直连断开后，授权自动结束。")
+                        .small()
+                        .color(Color32::from_rgb(132, 148, 169)),
+                );
+                ui.add_space(6.0);
+
                 let [width, height] = self.remote_frame_size.unwrap_or([1280, 720]);
                 let available = ui.available_size();
                 let scale = (available.x / width as f32)
                     .min(available.y / height as f32)
                     .max(0.01);
                 let size = Vec2::new(width as f32 * scale, height as f32 * scale);
-                ui.vertical_centered(|ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(if can_control {
-                            if self.remote_keyboard_captured {
-                                "控制已启用 · 按 Esc 释放键盘"
-                            } else {
-                                "控制已授权 · 点击画面接管键盘"
-                            }
-                        } else {
-                            "仅观看"
-                        });
-                        // 本地 Esc 被用作释放键盘，远端的 Esc 只能通过按钮发送
-                        if can_control && ui.small_button("发送 Esc").clicked() {
-                            self.send_remote_esc();
-                        }
-                    });
-                });
-                let response =
-                    ui.add(egui::Image::new((texture_id, size)).sense(Sense::click_and_drag()));
+                let response = Frame::new()
+                    .fill(Color32::BLACK)
+                    .corner_radius(CornerRadius::same(8))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(42, 60, 82)))
+                    .inner_margin(egui::Margin::symmetric(6, 6))
+                    .show(ui, |ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.add(
+                                egui::Image::new((texture_id, size)).sense(Sense::click_and_drag()),
+                            )
+                        })
+                        .inner
+                    })
+                    .inner;
                 if can_control {
                     self.handle_remote_canvas_input(ui, &response);
                 }
@@ -1174,7 +1313,10 @@ impl P2pChatApp {
                                     pressed: true,
                                 });
                             }
-                        } else if self.remote_pressed_scan_codes.remove(&(scan_code, extended)) {
+                        } else if self
+                            .remote_pressed_scan_codes
+                            .remove(&(scan_code, extended))
+                        {
                             // 已发送按下的键必须发送抬起，即使修饰键已先松开，
                             // 否则 host 端按键会一直保持按下
                             self.send_remote_input_event(RemoteInputEvent::Key {
@@ -1524,313 +1666,425 @@ impl Drop for AsyncRuntime {
     }
 }
 
+impl P2pChatApp {
+    fn render_top_bar(&mut self, ui: &mut Ui) {
+        let mut disconnect_clicked = false;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("P2P 信令聊天").strong().size(21.0));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if self.handle.is_some()
+                    && ui
+                        .add(
+                            egui::Button::new("断开连接")
+                                .min_size(Vec2::new(86.0, 34.0))
+                                .fill(Color32::from_rgb(28, 38, 53)),
+                        )
+                        .clicked()
+                {
+                    disconnect_clicked = true;
+                }
+                status_chip(ui, self.state, &self.status);
+            });
+        });
+
+        if disconnect_clicked {
+            self.disconnect();
+        }
+    }
+
+    fn render_sidebar(&mut self, ui: &mut Ui) {
+        section_label(ui, "信令服务器");
+        ui.add(
+            TextEdit::singleline(&mut self.server)
+                .hint_text(DEFAULT_SERVER)
+                .desired_width(f32::INFINITY),
+        );
+        if secondary_button(ui, true, "保存地址", 34.0).clicked() {
+            self.save_server();
+        }
+
+        ui.add_space(10.0);
+        ui.separator();
+        ui.add_space(4.0);
+
+        let has_session = self.handle.is_some();
+        if has_session {
+            section_label(ui, "房间");
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(self.room_label())
+                        .font(FontId::monospace(30.0))
+                        .strong(),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.small_button("复制房间号").clicked() {
+                        if let Some(room) = self.active_room.clone() {
+                            ui.ctx().copy_text(room.clone());
+                            self.status = format!("已复制房间号 {room}");
+                        }
+                    }
+                });
+            });
+
+            if self.state == ConnectionState::DirectFailed
+                && primary_button(ui, true, "重试直连", 36.0).clicked()
+            {
+                self.retry_direct();
+            }
+
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(4.0);
+            section_label(ui, "模式");
+
+            if side_mode_button(
+                ui,
+                self.main_view == MainView::Chat,
+                true,
+                "聊天与文件",
+                "点对点消息与文件传输",
+            )
+            .clicked()
+            {
+                self.switch_main_view(MainView::Chat);
+            }
+            if side_mode_button(
+                ui,
+                self.main_view == MainView::RemoteDesktop,
+                remote_desktop::is_supported(),
+                "远程桌面",
+                "点对点远程桌面共享",
+            )
+            .clicked()
+            {
+                self.switch_main_view(MainView::RemoteDesktop);
+            }
+        } else {
+            section_label(ui, "模式");
+            side_mode_button(ui, false, false, "聊天与文件", "连接后即可使用");
+            side_mode_button(ui, false, false, "远程桌面", "连接后即可使用");
+
+            ui.add_space(10.0);
+            Frame::new()
+                .fill(Color32::from_rgb(13, 28, 45))
+                .corner_radius(CornerRadius::same(8))
+                .stroke(Stroke::new(1.0, Color32::from_rgb(37, 65, 93)))
+                .inner_margin(egui::Margin::symmetric(12, 11))
+                .show(ui, |ui| {
+                    ui.label(RichText::new("点对点，安全直连").strong());
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(
+                            "信令服务器只用于房间匹配；直连建立后，消息与文件不会经由服务器中转。",
+                        )
+                        .small()
+                        .color(Color32::from_rgb(154, 171, 192)),
+                    );
+                });
+        }
+
+        ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
+            ui.label(
+                RichText::new(&self.status)
+                    .small()
+                    .color(Color32::from_rgb(137, 153, 174)),
+            );
+        });
+    }
+
+    fn switch_main_view(&mut self, next: MainView) {
+        if self.main_view != next && self.remote_keyboard_captured {
+            self.release_remote_keyboard();
+        }
+        self.main_view = next;
+    }
+
+    fn render_lobby(&mut self, ui: &mut Ui) {
+        ui.add_space(30.0);
+        ui.vertical_centered(|ui| {
+            ui.label(RichText::new("开始一次点对点连接").strong().size(25.0));
+            ui.label(
+                RichText::new("创建房间邀请对方加入，或输入对方提供的四位数字房间号。")
+                    .color(Color32::from_rgb(151, 165, 184)),
+            );
+        });
+        ui.add_space(26.0);
+
+        let can_connect = !self.server.trim().is_empty();
+        ui.columns(2, |columns| {
+            Frame::new()
+                .fill(Color32::from_rgb(12, 23, 38))
+                .corner_radius(CornerRadius::same(10))
+                .stroke(Stroke::new(1.0, Color32::from_rgb(46, 105, 176)))
+                .inner_margin(egui::Margin::symmetric(18, 18))
+                .show(&mut columns[0], |ui| {
+                    ui.set_min_height(230.0);
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(14.0);
+                        ui.label(RichText::new("创建房间").strong().size(20.0));
+                        ui.label(
+                            RichText::new("生成四位数字房间号，邀请对方加入。")
+                                .color(Color32::from_rgb(151, 165, 184)),
+                        );
+                        ui.add_space(32.0);
+                        if primary_button(ui, can_connect, "创建房间", 44.0).clicked() {
+                            self.create_room();
+                        }
+                        ui.add_space(18.0);
+                        ui.label(
+                            RichText::new("房间号生成后可一键复制。")
+                                .small()
+                                .color(Color32::from_rgb(125, 142, 164)),
+                        );
+                    });
+                });
+
+            Frame::new()
+                .fill(Color32::from_rgb(12, 23, 38))
+                .corner_radius(CornerRadius::same(10))
+                .stroke(Stroke::new(1.0, Color32::from_rgb(40, 55, 75)))
+                .inner_margin(egui::Margin::symmetric(18, 18))
+                .show(&mut columns[1], |ui| {
+                    ui.set_min_height(230.0);
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(14.0);
+                        ui.label(RichText::new("加入房间").strong().size(20.0));
+                        ui.label(
+                            RichText::new("输入对方提供的四位数字房间号。")
+                                .color(Color32::from_rgb(151, 165, 184)),
+                        );
+                        ui.add_space(22.0);
+                    });
+
+                    let room_response = ui.add(
+                        TextEdit::singleline(&mut self.room_input)
+                            .hint_text("0000")
+                            .char_limit(4)
+                            .horizontal_align(Align::Center)
+                            .desired_width(f32::INFINITY)
+                            .font(FontId::monospace(22.0)),
+                    );
+                    if room_response.changed() {
+                        normalize_room_input_in_place(&mut self.room_input);
+                    }
+                    let join_pressed = room_response.lost_focus()
+                        && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                    let can_join = can_connect && is_valid_room(&self.room_input);
+                    if primary_button(ui, can_join, "加入房间", 44.0).clicked() || join_pressed
+                    {
+                        self.join_room();
+                    }
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            RichText::new("请输入完整的四位数字。")
+                                .small()
+                                .color(Color32::from_rgb(125, 142, 164)),
+                        );
+                    });
+                });
+        });
+    }
+
+    fn render_mode_tabs(&mut self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            if workspace_tab(ui, self.main_view == MainView::Chat, "聊天与文件").clicked() {
+                self.switch_main_view(MainView::Chat);
+            }
+            if workspace_tab(ui, self.main_view == MainView::RemoteDesktop, "远程桌面").clicked()
+            {
+                self.switch_main_view(MainView::RemoteDesktop);
+            }
+        });
+        ui.separator();
+    }
+
+    fn render_chat_workspace(&mut self, ui: &mut Ui) {
+        ui.vertical_centered(|ui| {
+            ui.label(
+                RichText::new(if self.state == ConnectionState::Direct {
+                    "消息会通过直连传输，端到端更高效。"
+                } else {
+                    "正在等待点对点直连建立。"
+                })
+                .color(if self.state == ConnectionState::Direct {
+                    Color32::from_rgb(99, 197, 143)
+                } else {
+                    Color32::from_rgb(159, 174, 194)
+                }),
+            );
+        });
+        ui.add_space(8.0);
+
+        let mut transfer_action = None;
+        if !self.pending_offers.is_empty() || !self.transfers.is_empty() {
+            Frame::new()
+                .fill(Color32::from_rgb(13, 24, 39))
+                .corner_radius(CornerRadius::same(8))
+                .stroke(Stroke::new(1.0, Color32::from_rgb(37, 52, 71)))
+                .inner_margin(egui::Margin::symmetric(12, 10))
+                .show(ui, |ui| {
+                    ui.label(RichText::new("文件传输").strong());
+                    for offer in &self.pending_offers {
+                        if let Some(action) = pending_offer_row(ui, offer) {
+                            transfer_action = Some((offer.transfer_id.clone(), action));
+                        }
+                    }
+                    for transfer in &self.transfers {
+                        if let Some(action) = transfer_row(ui, transfer) {
+                            transfer_action = Some((transfer.transfer_id.clone(), action));
+                        }
+                    }
+                });
+            ui.add_space(8.0);
+        }
+
+        if let Some((transfer_id, action)) = transfer_action {
+            match action {
+                TransferAction::Accept => {
+                    if let Some(metadata) = self
+                        .pending_offers
+                        .iter()
+                        .find(|offer| offer.transfer_id == transfer_id)
+                        .cloned()
+                    {
+                        self.accept_file_offer(metadata);
+                    }
+                }
+                TransferAction::Reject => self.reject_file_offer(transfer_id),
+                TransferAction::Pause => self.pause_transfer(transfer_id),
+                TransferAction::Resume => self.resume_transfer(transfer_id),
+                TransferAction::Cancel => self.cancel_transfer(transfer_id),
+            }
+        }
+
+        let chat_height = (ui.available_height() - 60.0).max(120.0);
+        Frame::new()
+            .fill(Color32::from_rgb(10, 20, 34))
+            .corner_radius(CornerRadius::same(8))
+            .stroke(Stroke::new(1.0, Color32::from_rgb(35, 50, 69)))
+            .show(ui, |ui| {
+                ui.set_height(chat_height);
+                ScrollArea::vertical()
+                    .stick_to_bottom(true)
+                    .auto_shrink([false, false])
+                    .max_height(chat_height)
+                    .show(ui, |ui| {
+                        ui.set_max_width(finite_width(ui.available_width(), 120.0));
+                        ui.add_space(10.0);
+                        if self.messages.is_empty() {
+                            empty_chat(ui);
+                        } else {
+                            for line in &self.messages {
+                                chat_line(ui, line);
+                                ui.add_space(8.0);
+                            }
+                        }
+                        ui.add_space(10.0);
+                    });
+            });
+
+        ui.add_space(8.0);
+        Frame::new()
+            .fill(Color32::from_rgb(13, 24, 39))
+            .corner_radius(CornerRadius::same(8))
+            .stroke(Stroke::new(1.0, Color32::from_rgb(37, 52, 71)))
+            .inner_margin(egui::Margin::symmetric(8, 7))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let can_send = can_send_to_room(self.state, self.handle.is_some());
+                    let message_hint = if can_send {
+                        "输入消息"
+                    } else {
+                        "直连建立后可发送消息"
+                    };
+                    let button_size = Vec2::new(68.0, 36.0);
+                    let input_width =
+                        finite_width(ui.available_width() - button_size.x * 2.0 - 20.0, 100.0);
+                    let response = ui
+                        .add_enabled_ui(can_send, |ui| {
+                            ui.add_sized(
+                                Vec2::new(input_width, 36.0),
+                                TextEdit::singleline(&mut self.message_input)
+                                    .hint_text(message_hint),
+                            )
+                        })
+                        .inner;
+                    let send_pressed = can_send
+                        && response.lost_focus()
+                        && ui.input(|input| input.key_pressed(egui::Key::Enter));
+
+                    if ui
+                        .add_enabled(
+                            can_send,
+                            egui::Button::new("发送")
+                                .min_size(button_size)
+                                .fill(Color32::from_rgb(35, 102, 181)),
+                        )
+                        .clicked()
+                        || send_pressed
+                    {
+                        self.send_message();
+                    }
+                    if ui
+                        .add_enabled(can_send, egui::Button::new("文件").min_size(button_size))
+                        .clicked()
+                    {
+                        self.choose_and_send_file();
+                    }
+                });
+            });
+    }
+}
+
 impl eframe::App for P2pChatApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         self.poll_background_events();
 
-        egui::Panel::top("top_bar").show(ui, |ui| {
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                ui.heading("P2P 信令聊天");
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    status_chip(ui, self.state, &self.status);
-                });
-            });
-            ui.add_space(8.0);
-        });
+        egui::Panel::top("top_bar")
+            .resizable(false)
+            .min_size(64.0)
+            .max_size(64.0)
+            .frame(
+                Frame::new()
+                    .fill(Color32::from_rgb(9, 18, 30))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(34, 48, 66)))
+                    .inner_margin(egui::Margin::symmetric(16, 12)),
+            )
+            .show(ui, |ui| self.render_top_bar(ui));
 
         egui::Panel::left("connection_panel")
             .resizable(false)
-            .min_size(284.0)
-            .max_size(284.0)
-            .show(ui, |ui| {
-                ui.add_space(8.0);
-                ui.label(RichText::new("信令服务器").strong());
-                ui.add_space(6.0);
-                ui.add(
-                    TextEdit::singleline(&mut self.server)
-                        .hint_text("p2p-signaling.yizhe.studio")
-                        .desired_width(f32::INFINITY),
-                );
-                ui.add_space(8.0);
-                if ui.button("保存地址").clicked() {
-                    self.save_server();
-                }
-
-                ui.separator();
-                ui.label(RichText::new("房间").strong());
-                ui.add_space(6.0);
-                let room_label = self.room_label().to_string();
-                let active_room = self.active_room.clone().filter(|room| !room.is_empty());
-                let mut copied_room = None;
-                let mut disconnect_clicked = false;
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(room_label).font(FontId::monospace(32.0)));
-                    if let Some(room) = active_room {
-                        if ui.small_button("复制").clicked() {
-                            ui.ctx().copy_text(room.clone());
-                            copied_room = Some(room);
-                        }
-                    }
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if self.handle.is_some() && ui.button("断开").clicked() {
-                            disconnect_clicked = true;
-                        }
-                    });
-                });
-                if let Some(room) = copied_room {
-                    self.status = format!("已复制房间号 {room}");
-                }
-                if disconnect_clicked {
-                    self.disconnect();
-                }
-                ui.add_space(8.0);
-
-                let can_connect = !self.server.trim().is_empty();
-                if full_width_button(ui, can_connect, "创建房间", 36.0).clicked() {
-                    self.create_room();
-                }
-
-                ui.add_space(14.0);
-                ui.label("输入房间号");
-                let room_response = ui.add(
-                    TextEdit::singleline(&mut self.room_input)
-                        .hint_text("0000")
-                        .char_limit(4)
-                        .desired_width(f32::INFINITY),
-                );
-                if room_response.changed() {
-                    normalize_room_input_in_place(&mut self.room_input);
-                }
-
-                let join_pressed = room_response.lost_focus()
-                    && ui.input(|input| input.key_pressed(egui::Key::Enter));
-                if full_width_button(
-                    ui,
-                    can_connect && is_valid_room(&self.room_input),
-                    "加入房间",
-                    36.0,
-                )
-                .clicked()
-                    || join_pressed
-                {
-                    self.join_room();
-                }
-
-                if full_width_button(
-                    ui,
-                    self.handle.is_some() && self.state == ConnectionState::DirectFailed,
-                    "重试直连",
-                    36.0,
-                )
-                .clicked()
-                {
-                    self.retry_direct();
-                }
-
-                ui.separator();
-                ui.label(RichText::new("远程桌面").strong());
-                ui.add_space(6.0);
-                if !remote_desktop::is_supported() {
-                    ui.label("当前平台暂不支持共享屏幕");
-                } else if self.state == ConnectionState::Direct && !self.remote_peer_supported {
-                    ui.label("对方客户端不支持远程桌面");
-                }
-
-                if matches!(self.remote_state, RemoteDesktopState::Idle) {
-                    let selected_name = self
-                        .remote_displays
-                        .get(self.remote_display_index)
-                        .map(|display| display.name.clone())
-                        .unwrap_or_else(|| "无可用显示器".into());
-                    egui::ComboBox::from_id_salt("remote-display")
-                        .selected_text(selected_name)
-                        .width(ui.available_width())
-                        .show_ui(ui, |ui| {
-                            for (index, display) in self.remote_displays.iter().enumerate() {
-                                ui.selectable_value(
-                                    &mut self.remote_display_index,
-                                    index,
-                                    format!(
-                                        "{} ({}×{})",
-                                        display.name, display.width, display.height
-                                    ),
-                                );
-                            }
-                        });
-                    if ui.small_button("刷新显示器列表").clicked() {
-                        self.refresh_remote_displays();
-                    }
-                    ui.checkbox(&mut self.remote_allow_control, "允许对方临时控制");
-                    let can_share = self.state == ConnectionState::Direct
-                        && self.remote_peer_supported
-                        && !self.remote_displays.is_empty();
-                    if full_width_button(ui, can_share, "共享屏幕", 36.0).clicked() {
-                        self.start_remote_desktop_offer();
-                    }
-                } else {
-                    match &self.remote_state {
-                        RemoteDesktopState::Sharing { allow_control, .. } => {
-                            let mut next = *allow_control;
-                            if ui.checkbox(&mut next, "允许对方临时控制").changed() {
-                                self.update_remote_control_permission(next);
-                            }
-                            ui.label("正在共享本机屏幕");
-                        }
-                        RemoteDesktopState::Viewing { can_control, .. } => {
-                            ui.label(if *can_control {
-                                "正在观看，可临时控制"
-                            } else {
-                                "正在观看，仅查看"
-                            });
-                        }
-                        RemoteDesktopState::OutgoingPending(_) => {
-                            ui.label("等待对方接受共享");
-                        }
-                        RemoteDesktopState::IncomingPending(_) => {
-                            ui.label("收到屏幕共享请求");
-                        }
-                        RemoteDesktopState::Idle => {}
-                    }
-                    if full_width_button(ui, true, "停止远程桌面", 36.0).clicked() {
-                        self.stop_remote_desktop("用户停止远程桌面");
-                    }
-                }
-
-                ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
-                    ui.label(RichText::new(&self.status).color(Color32::from_rgb(158, 169, 185)));
-                });
-            });
-
-        egui::CentralPanel::default().show(ui, |ui| {
-            ui.add_space(8.0);
-            let previous_view = self.main_view;
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.main_view, MainView::Chat, "聊天与文件");
-                ui.selectable_value(&mut self.main_view, MainView::RemoteDesktop, "远程桌面");
-            });
-            if previous_view != self.main_view && self.remote_keyboard_captured {
-                self.release_remote_keyboard();
-            }
-            ui.separator();
-            if self.main_view == MainView::RemoteDesktop {
-                self.remote_desktop_view(ui);
-                return;
-            }
-            let mut transfer_action = None;
-            if !self.pending_offers.is_empty() || !self.transfers.is_empty() {
+            .min_size(246.0)
+            .max_size(246.0)
+            .frame(
                 Frame::new()
-                    .fill(Color32::from_rgb(16, 22, 30))
-                    .corner_radius(CornerRadius::same(8))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(39, 51, 67)))
-                    .inner_margin(egui::Margin::symmetric(12, 10))
-                    .show(ui, |ui| {
-                        ui.label(RichText::new("文件传输").strong());
-                        ui.add_space(4.0);
-                        for offer in &self.pending_offers {
-                            if let Some(action) = pending_offer_row(ui, offer) {
-                                transfer_action = Some((offer.transfer_id.clone(), action));
-                            }
-                            ui.add_space(6.0);
-                        }
-                        for transfer in &self.transfers {
-                            if let Some(action) = transfer_row(ui, transfer) {
-                                transfer_action = Some((transfer.transfer_id.clone(), action));
-                            }
-                            ui.add_space(6.0);
-                        }
-                    });
-                ui.add_space(10.0);
-            }
+                    .fill(Color32::from_rgb(8, 17, 29))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(34, 48, 66)))
+                    .inner_margin(egui::Margin::symmetric(14, 12)),
+            )
+            .show(ui, |ui| self.render_sidebar(ui));
 
-            if let Some((transfer_id, action)) = transfer_action {
-                match action {
-                    TransferAction::Accept => {
-                        if let Some(metadata) = self
-                            .pending_offers
-                            .iter()
-                            .find(|offer| offer.transfer_id == transfer_id)
-                            .cloned()
-                        {
-                            self.accept_file_offer(metadata);
-                        }
-                    }
-                    TransferAction::Reject => self.reject_file_offer(transfer_id),
-                    TransferAction::Pause => self.pause_transfer(transfer_id),
-                    TransferAction::Resume => self.resume_transfer(transfer_id),
-                    TransferAction::Cancel => self.cancel_transfer(transfer_id),
-                }
-            }
-
-            let chat_height = (ui.available_height() - 58.0).max(120.0);
-            Frame::new()
-                .fill(Color32::from_rgb(18, 24, 33))
-                .corner_radius(CornerRadius::same(8))
-                .stroke(Stroke::new(1.0, Color32::from_rgb(39, 51, 67)))
-                .show(ui, |ui| {
-                    ui.set_height(chat_height);
-                    ScrollArea::vertical()
-                        .stick_to_bottom(true)
-                        .auto_shrink([false, false])
-                        .max_height(chat_height)
-                        .show(ui, |ui| {
-                            ui.set_max_width(finite_width(ui.available_width(), 120.0));
-                            ui.add_space(10.0);
-                            if self.messages.is_empty() {
-                                empty_chat(ui);
-                            } else {
-                                for line in &self.messages {
-                                    chat_line(ui, line);
-                                    ui.add_space(8.0);
-                                }
-                            }
-                            ui.add_space(10.0);
-                        });
-                });
-
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                let can_send = can_send_to_room(self.state, self.handle.is_some());
-                let message_hint = if can_send {
-                    "输入消息"
-                } else {
-                    "直连建立后可发送消息"
-                };
-                let button_size = Vec2::new(72.0, 32.0);
-                let composer_button_width = button_size.x * 2.0 + ui.spacing().item_spacing.x * 2.0;
-                let message_input_width =
-                    finite_width(ui.available_width() - composer_button_width, 100.0);
-                let response = ui
-                    .add_enabled_ui(can_send, |ui| {
-                        ui.add_sized(
-                            Vec2::new(message_input_width, 32.0),
-                            TextEdit::singleline(&mut self.message_input).hint_text(message_hint),
-                        )
-                    })
-                    .inner;
-                let send_pressed = can_send
-                    && response.lost_focus()
-                    && ui.input(|input| input.key_pressed(egui::Key::Enter));
-
-                if ui
-                    .add_enabled(can_send, egui::Button::new("发送").min_size(button_size))
-                    .clicked()
-                    || send_pressed
-                {
-                    self.send_message();
+        egui::CentralPanel::default()
+            .frame(
+                Frame::new()
+                    .fill(Color32::from_rgb(9, 18, 31))
+                    .inner_margin(egui::Margin::symmetric(16, 14)),
+            )
+            .show(ui, |ui| {
+                if self.handle.is_none() {
+                    self.render_lobby(ui);
+                    return;
                 }
 
-                if ui
-                    .add_enabled(can_send, egui::Button::new("文件").min_size(button_size))
-                    .clicked()
-                {
-                    self.choose_and_send_file();
+                self.render_mode_tabs(ui);
+                ui.add_space(8.0);
+                match self.main_view {
+                    MainView::Chat => self.render_chat_workspace(ui),
+                    MainView::RemoteDesktop => self.remote_desktop_view(ui),
                 }
             });
-        });
     }
 }
-
 impl Drop for P2pChatApp {
     fn drop(&mut self) {
         self.close_current_session();
@@ -1842,24 +2096,24 @@ fn configure_style(ctx: &Context) {
 
     ctx.set_theme(egui::Theme::Dark);
     let mut style = (*ctx.style_of(egui::Theme::Dark)).clone();
-    style.spacing.item_spacing = Vec2::new(10.0, 10.0);
-    style.spacing.button_padding = Vec2::new(12.0, 8.0);
+    style.spacing.item_spacing = Vec2::new(8.0, 8.0);
+    style.spacing.button_padding = Vec2::new(12.0, 7.0);
     style.visuals = egui::Visuals::dark();
-    style.visuals.panel_fill = Color32::from_rgb(13, 18, 26);
-    style.visuals.window_fill = Color32::from_rgb(18, 24, 33);
-    style.visuals.extreme_bg_color = Color32::from_rgb(10, 15, 22);
-    style.visuals.faint_bg_color = Color32::from_rgb(24, 32, 43);
-    style.visuals.weak_text_color = Some(Color32::from_rgb(150, 161, 176));
-    style.visuals.widgets.noninteractive.fg_stroke.color = Color32::from_rgb(218, 226, 235);
+    style.visuals.panel_fill = Color32::from_rgb(9, 18, 31);
+    style.visuals.window_fill = Color32::from_rgb(12, 23, 38);
+    style.visuals.extreme_bg_color = Color32::from_rgb(6, 14, 25);
+    style.visuals.faint_bg_color = Color32::from_rgb(18, 31, 48);
+    style.visuals.weak_text_color = Some(Color32::from_rgb(145, 160, 180));
+    style.visuals.widgets.noninteractive.fg_stroke.color = Color32::from_rgb(222, 230, 240);
     style.visuals.widgets.noninteractive.bg_stroke =
-        Stroke::new(1.0, Color32::from_rgb(39, 51, 67));
-    style.visuals.widgets.inactive.bg_fill = Color32::from_rgb(30, 39, 52);
-    style.visuals.widgets.inactive.fg_stroke.color = Color32::from_rgb(225, 231, 239);
-    style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(46, 59, 76);
+        Stroke::new(1.0, Color32::from_rgb(39, 54, 74));
+    style.visuals.widgets.inactive.bg_fill = Color32::from_rgb(24, 35, 51);
+    style.visuals.widgets.inactive.fg_stroke.color = Color32::from_rgb(224, 232, 241);
+    style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(31, 50, 74);
     style.visuals.widgets.hovered.fg_stroke.color = Color32::WHITE;
-    style.visuals.widgets.active.bg_fill = Color32::from_rgb(53, 103, 132);
+    style.visuals.widgets.active.bg_fill = Color32::from_rgb(37, 102, 181);
     style.visuals.widgets.active.fg_stroke.color = Color32::WHITE;
-    style.visuals.selection.bg_fill = Color32::from_rgb(64, 127, 164);
+    style.visuals.selection.bg_fill = Color32::from_rgb(43, 118, 214);
     ctx.set_style_of(egui::Theme::Dark, style);
 }
 
@@ -1924,9 +2178,10 @@ fn status_chip(ui: &mut Ui, state: ConnectionState, text: &str) {
     };
 
     Frame::new()
-        .fill(Color32::from_rgb(24, 32, 43))
+        .fill(Color32::from_rgb(17, 29, 45))
         .corner_radius(CornerRadius::same(8))
         .stroke(Stroke::new(1.0, color))
+        .inner_margin(egui::Margin::symmetric(10, 6))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(label).color(color).strong());
@@ -1985,11 +2240,82 @@ fn bubble(ui: &mut Ui, name: &str, text: &str, color: Color32) {
         });
 }
 
-fn full_width_button(ui: &mut Ui, enabled: bool, label: &str, height: f32) -> egui::Response {
+fn section_label(ui: &mut Ui, label: &str) {
+    ui.label(RichText::new(label).strong().size(15.0));
+    ui.add_space(2.0);
+}
+
+fn primary_button(ui: &mut Ui, enabled: bool, label: &str, height: f32) -> egui::Response {
     let width = finite_width(ui.available_width(), 120.0);
     ui.add_enabled(
         enabled,
-        egui::Button::new(label).min_size(Vec2::new(width, height)),
+        egui::Button::new(RichText::new(label).strong())
+            .min_size(Vec2::new(width, height))
+            .fill(Color32::from_rgb(35, 102, 181)),
+    )
+}
+
+fn secondary_button(ui: &mut Ui, enabled: bool, label: &str, height: f32) -> egui::Response {
+    let width = finite_width(ui.available_width(), 120.0);
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(label)
+            .min_size(Vec2::new(width, height))
+            .fill(Color32::from_rgb(24, 35, 51)),
+    )
+}
+
+fn side_mode_button(
+    ui: &mut Ui,
+    selected: bool,
+    enabled: bool,
+    title: &str,
+    subtitle: &str,
+) -> egui::Response {
+    let width = finite_width(ui.available_width(), 160.0);
+    let text_color = if selected {
+        Color32::WHITE
+    } else {
+        Color32::from_rgb(194, 205, 219)
+    };
+    let fill = if selected {
+        Color32::from_rgb(21, 55, 91)
+    } else {
+        Color32::from_rgb(15, 27, 43)
+    };
+    let stroke = if selected {
+        Stroke::new(1.0, Color32::from_rgb(58, 137, 230))
+    } else {
+        Stroke::new(1.0, Color32::from_rgb(38, 53, 72))
+    };
+    let text = RichText::new(format!("{title}\n{subtitle}"))
+        .color(text_color)
+        .size(14.0);
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(text)
+            .min_size(Vec2::new(width, 56.0))
+            .fill(fill)
+            .stroke(stroke),
+    )
+}
+
+fn workspace_tab(ui: &mut Ui, selected: bool, label: &str) -> egui::Response {
+    let fill = if selected {
+        Color32::from_rgb(25, 65, 108)
+    } else {
+        Color32::TRANSPARENT
+    };
+    let stroke = if selected {
+        Stroke::new(1.0, Color32::from_rgb(58, 137, 230))
+    } else {
+        Stroke::NONE
+    };
+    ui.add(
+        egui::Button::new(RichText::new(label).strong().size(15.0))
+            .min_size(Vec2::new(116.0, 34.0))
+            .fill(fill)
+            .stroke(stroke),
     )
 }
 
